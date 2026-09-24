@@ -485,9 +485,6 @@ class GPONTab(ttk.Frame):
         ttk.Entry(cf, textvariable=self.lon_var, width=10).grid(row=0, column=3, padx=4)
         ttk.Label(frame, text="Подсказка: координаты можно получить с OSM или Google Maps",
                   foreground="gray", font=("Segoe UI", 8), wraplength=380).pack(anchor="w", **pad)
-        ttk.Label(frame, text="Ожидаемое число домохозяйств:").pack(anchor="w", **pad)
-        self.hh_var = tk.IntVar(value=200)
-        ttk.Entry(frame, textvariable=self.hh_var).pack(fill="x", **pad)
         ttk.Label(frame, text="Радиус поиска, м:").pack(anchor="w", **pad)
         self.radius_var = tk.DoubleVar(value=2500.0)
         ttk.Scale(frame, from_=500, to=5000, variable=self.radius_var,
@@ -519,12 +516,17 @@ class GPONTab(ttk.Frame):
         self.min_zone_label.pack(anchor="e", padx=8)
         self.min_zone_var.trace_add("write", lambda *_: self.min_zone_label.config(text=str(self.min_zone_var.get())))
         ttk.Separator(frame).pack(fill="x", **pad)
+        self.use_cv_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="🛰 CV-детекция крыш по космоснимку (HSV + морфология)",
+                        variable=self.use_cv_var).pack(anchor="w", **pad)
+        ttk.Label(frame, text="Дополняет OSM-здания крышами, найденными по цвету "
+                  "на спутнике. Контекст-фильтры: близость к дороге, "
+                  "не ближе 15м к OSM-зданию.",
+                  foreground="gray", font=("Segoe UI", 8),
+                  wraplength=380).pack(anchor="w", **pad)
         self.render_map_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="🗺 Отрисовать карту сети (спутник + слои)",
                         variable=self.render_map_var).pack(anchor="w", **pad)
-        self.download_tiles_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="📥 Скачать спутниковые тайлы Google z18",
-                        variable=self.download_tiles_var).pack(anchor="w", **pad)
         ttk.Label(frame, text="Первый запуск: ~30–60 сек на 1000 тайлов. Кэш сохраняется.",
                   foreground="gray", font=("Segoe UI", 8), wraplength=380).pack(anchor="w", **pad)
         self.plan_button = ttk.Button(frame, text="🚀 Запустить планирование",
@@ -540,7 +542,8 @@ class GPONTab(ttk.Frame):
         ttk.Button(frame, text="📂 Открыть папку GPON output", command=self._open_output_dir).pack(fill="x", **pad)
         ttk.Button(frame, text="💾 Сохранить отчёт (JSON)...", command=self._save_report).pack(fill="x", **pad)
         ttk.Separator(frame).pack(fill="x", **pad)
-        info_text = ("Алгоритм:\n1. fetch: OSM-дороги и здания\n2. households: кластеризация (eps=16м)\n"
+        info_text = ("Алгоритм:\n1. fetch: OSM + космоснимок Google z18\n"
+                     "2. households: OSM + CV-крыши → кластер (eps=16м)\n"
                      "3. anchor: скоринг ЦУ\n4. network: MST + SPT (Dijkstra)\n"
                      "5. boq: схема A + схема D\n6. optical_budget: затухание худшей линии\n\n"
                      "Оптимизации:\n• один вызов Dijkstra\n• CSR + KDTree (scipy)\n• float32 для памяти")
@@ -624,7 +627,6 @@ class GPONTab(ttk.Frame):
         try:
             lat = float(self.lat_var.get())
             lon = float(self.lon_var.get())
-            hh = int(self.hh_var.get())
             radius = float(self.radius_var.get())
             name = self.village_name_var.get().strip() or "test_village"
         except Exception as e:
@@ -635,19 +637,20 @@ class GPONTab(ttk.Frame):
             return
         fa_raw = self.force_anchor_var.get().strip()
         force_anchor = int(fa_raw) if fa_raw else None
-        task = dict(name=name, lat=lat, lon=lon, hh=hh, radius=radius,
+        task = dict(name=name, lat=lat, lon=lon, radius=radius,
                     zone_type=self.zone_var.get(), force_anchor=force_anchor,
                     s_min_km=float(self.s_min_var.get()),
                     min_zone_dh=int(self.min_zone_var.get()),
                     render_map=bool(self.render_map_var.get()),
-                    download_tiles=bool(self.download_tiles_var.get()))
+                    use_cv=bool(self.use_cv_var.get()))
         self._planning = True
         self.plan_button.config(state="disabled")
         self.plan_progress["value"] = 0
         self.plan_progress_var.set("Запуск...")
         self._append_report("header", f"\n=== Запуск планирования: {name} ===\n")
         self._append_report("", f"Координаты: {lat:.4f}, {lon:.4f}\n")
-        self._append_report("", f"Ожидаемое ДХ: {hh}, радиус поиска: {radius} м\n\n")
+        self._append_report("", f"Радиус поиска: {radius} м, CV: "
+                            f"{'вкл' if task['use_cv'] else 'выкл'}\n\n")
         self._worker_thread = threading.Thread(target=self._worker, args=(task,), daemon=True)
         self._worker_thread.start()
 
@@ -659,16 +662,18 @@ class GPONTab(ttk.Frame):
             planner.params['s_min_km'] = task['s_min_km']
             planner.params['min_zone_dh'] = task['min_zone_dh']
             village = VillageSpec(key=task['name'], name=task['name'], lat=task['lat'], lon=task['lon'],
-                                   hh=task['hh'], radius_m=task['radius'], zone_type=task['zone_type'],
+                                   radius_m=task['radius'], zone_type=task['zone_type'],
                                    zone_radius=900.0, force_anchor=task['force_anchor'])
 
             def progress_cb(msg, frac):
                 self._put("progress", {"msg": msg, "frac": frac})
-                if any(kw in msg.lower() for kw in ['osm:', 'найдено', 'сеть:', 'boq:', 'бюджет', 'граница', 'цу:']):
+                if any(kw in msg.lower() for kw in ['osm:', 'найдено', 'сеть:', 'boq:', 'бюджет', 'граница', 'цу:',
+                                                     'cv:', 'мозаика', 'космоснимку']):
                     self._put("log", msg)
 
             result = planner.run(village, progress_cb=progress_cb,
-                                  render_map=task['render_map'], download_tiles=task['download_tiles'])
+                                  render_map=task['render_map'],
+                                  use_cv_detection=task['use_cv'])
             self._put("done", result)
         except Exception as e:
             logger.exception("Ошибка в потоке GPON")
@@ -731,13 +736,13 @@ class GPONTab(ttk.Frame):
         self._append_report("", f"  Имя:        {v.get('name', '?')}\n")
         self._append_report("", f"  Координаты: {v.get('lat', 0):.4f}, {v.get('lon', 0):.4f}\n")
         self._append_report("", f"  Радиус:     {v.get('radius_m', 0):.0f} м\n\n")
-        self._append_report("section", "▼ Домохозяйства\n")
-        dev = 100 * (len(hh) - v.get('hh', 0)) / max(1, v.get('hh', 1))
-        dev_tag = "ok" if abs(dev) <= 25 else "warn"
-        self._append_report("", f"  Найдено:    {len(hh)} ДХ\n")
-        self._append_report("", f"  Заказ:      {v.get('hh', 0)} ДХ\n")
-        self._append_report("", f"  Отклонение: ")
-        self._append_report(dev_tag, f"{dev:+.1f}%\n\n")
+        self._append_report("section", "▼ Домохозяйства (по космоснимку + OSM)\n")
+        hs = result.get('hh_stats', {})
+        self._append_report("", f"  Найдено ДХ:    {len(hh)}\n")
+        self._append_report("num", f"  OSM зданий:   {hs.get('osm', '?')}\n")
+        self._append_report("num", f"  CV крыш:       {hs.get('cv', '?')}\n")
+        self._append_report("num", f"  Всего построек: {hs.get('total_blds', '?')}\n")
+        self._append_report("num", f"  Усадеб:        {hs.get('yards', '?')}\n\n")
         anchor = result.get('anchor_cands', [{}])[0]
         self._append_report("section", "▼ Центральный узел (ЦУ)\n")
         self._append_report("", f"  id OSM:     {anchor.get('id', '?')}\n")

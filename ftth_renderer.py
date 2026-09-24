@@ -261,8 +261,12 @@ def legend_weight(rect, hh_pts, coup_pts, orsh_pts, cu_pt):
 
 def render_network_map(village, bbox, geo, households, network, boq, optical_budget,
                        work_dir, output_dir, cache_tiles_dir,
-                       progress_cb=None, download_tiles=True):
+                       progress_cb=None, download_tiles=True,
+                       preloaded_mosaic=None):
     """Отрисовать карту сети FTTH (схема D) на спутниковой мозаике.
+
+    Если preloaded_mosaic (PIL.Image) передан — используется он вместо
+    повторного скачивания/сборки тайлов.
 
     Возвращает (jpg_path, preview_path).
     """
@@ -276,7 +280,10 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
             except Exception:
                 pass
 
-    if download_tiles:
+    if preloaded_mosaic is not None:
+        _notify("Использую предзагруженную мозаику...", 0.0)
+        base = preloaded_mosaic.convert('RGB') if hasattr(preloaded_mosaic, 'convert') else preloaded_mosaic
+    elif download_tiles:
         _notify("Скачиваю спутниковые тайлы Google z18...", 0.0)
         try:
             base, geo_tiles = stitch_mosaic(tuple(bbox), 18, cache_tiles_dir,

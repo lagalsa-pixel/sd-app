@@ -42,6 +42,9 @@ DEFAULT_PARAMS: Dict[str, Any] = dict(
     boundary_grid_m=50.0, boundary_margin_m=300.0, boundary_close_m=100.0,
     boundary_min_bld=15, boundary_keep_frac=0.65, probe_margin_m=900.0,
     hh_eps_m=16.0, hh_road_max_m=60.0, hh_main_area_m2=36.0,
+    hh_cv_near_road_m=75.0, hh_cv_ctx_m=90.0, hh_cv_min_sep_m=15.0,
+    hh_cv_min_area_px=280, hh_cv_max_area_px=2400, hh_cv_min_side_px=10,
+    hh_cv_min_fill=0.5, hh_cv_max_aspect=4.0,
     net_densify_m=4.0, net_snap_max_m=90.0, net_merge_m=50.0,
     net_dedup_m=15.0, net_max_drop_m=120.0, net_intermediate_m=100.0,
     ob_alpha_db_km=0.35, ob_splitter_il_db=21.0, ob_splice_db=0.10,
@@ -188,6 +191,84 @@ def osm_features(nodes, ways):
                 pois.append(dict(id=wid, lat=la, lon=lo,
                                  tags={k: tags[k] for k in ('amenity', 'office', 'shop', 'name') if k in tags}))
     return roads, buildings, pois
+
+
+# ----------------------------- CV-детекция крыш (numpy + scipy, без OpenCV) ---
+def detect_roofs_numpy(mos_rgb: np.ndarray, mpp: float,
+                        P: Callable) -> List[Tuple[float, float, float, float]]:
+    """CV-детекция крыш через HSV-маски цветов кровли + морфология.
+
+    Аналог detect_roofs() из оригинального ftth_pipeline.py, но без OpenCV:
+      - PIL для конвертации RGB→HSV;
+      - numpy для масок цветов (синий/красный/оранжевый/зелёный/серый);
+      - scipy.ndimage для морфологии (close + open) и связных компонент.
+
+    Возвращает список (x, y, w, h) — кандидаты крыш в пикселях мозаики.
+    Площади 40–350 м² (при ~0.38 м/px → ~280–2400 px²).
+    """
+    from scipy import ndimage
+    from PIL import Image
+
+    # Конвертация в HSV через PIL (быстрее, чем ручная формула в numpy)
+    img = Image.fromarray(mos_rgb)
+    hsv_img = img.convert('HSV')
+    hsv = np.array(hsv_img)
+    h = hsv[..., 0].astype(np.int32)  # PIL HSV: H 0-255
+    s = hsv[..., 1].astype(np.int32)  # S 0-255
+    v = hsv[..., 2].astype(np.int32)  # V 0-255
+
+    # Маски цветов кровли (PIL H = cv2 H * 2)
+    blue = (h >= 180) & (h <= 264) & (s > 65) & (v > 50)
+    red = ((h <= 24) | (h >= 336)) & (s > 75) & (v > 55)
+    orange = (h >= 26) & (h <= 70) & (s > 85) & (v > 95)
+    green = (h >= 80) & (h <= 170) & (s > 65) & (v > 50)
+    gray = (s < 50) & (v > 140) & (v < 248)
+    mask = blue | red | orange | green | gray
+
+    m = mask.astype(bool)
+
+    # Морфология: CLOSE (dilate→erode) затем OPEN (erode→dilate)
+    struct = np.ones((3, 3), dtype=bool)
+    m_closed = ndimage.binary_dilation(m, structure=struct)
+    m_closed = ndimage.binary_erosion(m_closed, structure=struct)
+    m_opened = ndimage.binary_erosion(m_closed, structure=struct)
+    m_opened = ndimage.binary_dilation(m_opened, structure=struct)
+
+    # Связные компоненты
+    labeled, n_comp = ndimage.label(m_opened)
+    if n_comp == 0:
+        return []
+
+    min_area = P('hh_cv_min_area_px')
+    max_area = P('hh_cv_max_area_px')
+    min_side = P('hh_cv_min_side_px')
+    min_fill = P('hh_cv_min_fill')
+    max_aspect = P('hh_cv_max_aspect')
+
+    # Векторизованный расчёт площадей и bounding boxes
+    slices = ndimage.find_objects(labeled)
+    res = []
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        component_mask = (labeled[sl] == i)
+        area = int(component_mask.sum())
+        if area < min_area or area > max_area:
+            continue
+        y0, y1 = sl[0].start, sl[0].stop
+        x0, x1 = sl[1].start, sl[1].stop
+        w_ = x1 - x0
+        h_ = y1 - y0
+        if w_ < min_side or h_ < min_side:
+            continue
+        fill_ratio = area / (w_ * h_)
+        if fill_ratio < min_fill:
+            continue
+        aspect = max(w_, h_) / max(1, min(w_, h_))
+        if aspect > max_aspect:
+            continue
+        res.append((x0 + w_ / 2.0, y0 + h_ / 2.0, float(w_), float(h_)))
+    return res
 
 
 # ----------------------------- Векторизованная граница села -----------------------------
@@ -660,8 +741,26 @@ def anchor_candidates_vectorized(v_lat, v_lon, buildings, roads, hhs, bbox,
 
 
 # ----------------------------- Домохозяйства -----------------------------
-def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P):
+def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
+                      mosaic_rgb=None, progress_cb=None):
+    """Детекция домохозяйств: OSM-здания + опциональный CV-суплемент крыш.
+
+    Если mosaic_rgb передан (numpy array HxWx3), используется CV-детекция
+    крыш по спутниковому снимку для дополнения OSM-данных. Кандидаты
+    фильтруются по контексту: близость к дороге, не ближе 15м к OSM-зданию,
+    рядом с другими объектами.
+
+    Возвращает (households, stats) где stats = dict(osm=N, cv=M, total_blds=K).
+    """
     from scipy.spatial import cKDTree
+
+    def _notify(msg, frac=0.0):
+        if progress_cb:
+            try:
+                progress_cb(msg, frac)
+            except Exception:
+                pass
+
     road_pts = []
     for r in roads:
         poly = [geo_to_px(la, lo, west, north, mpp) for la, lo in r['pts']]
@@ -688,6 +787,7 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P):
         d, _ = road_tree.query([x, y])
         return float(d) * mpp < max_m
 
+    # --- OSM-здания в зоне ---
     osm_blds = []
     for b in buildings:
         la, lo = b['center']
@@ -708,11 +808,47 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P):
         osm_blds.append(dict(cx=(min(xs) + max(xs)) / 2, cy=(min(ys) + max(ys)) / 2,
                               w=max(xs) - min(xs), h=max(ys) - min(ys),
                               src='osm', tags=b.get('tags', {}), poly=pts))
+    _notify(f"OSM-зданий в зоне: {len(osm_blds)}", 0.1)
 
+    # --- CV-супplement крыш по космоснимку ---
+    cv_blds = []
+    if mosaic_rgb is not None:
+        _notify("CV-детекция крыш по космоснимку...", 0.15)
+        roofs = detect_roofs_numpy(mosaic_rgb, mpp, P)
+        _notify(f"CV: найдено {len(roofs)} кандидатов крыш", 0.4)
+
+        # Контекст-фильтры (2 итерации: возле дорог → возле принятых)
+        accepted = []
+        for it in range(2):
+            for (x, y, w_, h_) in roofs:
+                if any(abs(x - a[0]) < 8 and abs(y - a[1]) < 8 for a in accepted):
+                    continue
+                # Не ближе 15м к OSM-зданию
+                if any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_min_sep_m')
+                       for b in osm_blds):
+                    continue
+                ctx_ok = (near_road(x, y, P('hh_cv_near_road_m')) if it == 0 else
+                          any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_ctx_m')
+                              for b in osm_blds + [dict(cx=a[0], cy=a[1]) for a in accepted]))
+                if ctx_ok:
+                    accepted.append((x, y, w_, h_))
+        cv_blds = [dict(cx=a[0], cy=a[1], w=a[2], h=a[3], src='cv', tags={},
+                        poly=[(a[0] - a[2] / 2, a[1] - a[3] / 2),
+                              (a[0] + a[2] / 2, a[1] - a[3] / 2),
+                              (a[0] + a[2] / 2, a[1] + a[3] / 2),
+                              (a[0] - a[2] / 2, a[1] + a[3] / 2)])
+                  for a in accepted]
+        _notify(f"CV: принято {len(cv_blds)} крыш после контекст-фильтров", 0.5)
+    else:
+        _notify("CV-супплект: выключен (нет космоснимка)", 0.15)
+
+    all_blds = osm_blds + cv_blds
+
+    # --- Кластеризация усадеб (eps=16м) ---
     eps = P('hh_eps_m') / mpp
-    used = [False] * len(osm_blds)
+    used = [False] * len(all_blds)
     yards: List[List[int]] = []
-    order = sorted(range(len(osm_blds)), key=lambda i: -(osm_blds[i]['w'] * osm_blds[i]['h']))
+    order = sorted(range(len(all_blds)), key=lambda i: -(all_blds[i]['w'] * all_blds[i]['h']))
     for i in order:
         if used[i]:
             continue
@@ -721,19 +857,21 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P):
         while queue:
             j = queue.pop()
             yard.append(j)
-            for k in range(len(osm_blds)):
+            for k in range(len(all_blds)):
                 if used[k]:
                     continue
-                if math.hypot(osm_blds[j]['cx'] - osm_blds[k]['cx'],
-                               osm_blds[j]['cy'] - osm_blds[k]['cy']) < eps:
+                if math.hypot(all_blds[j]['cx'] - all_blds[k]['cx'],
+                               all_blds[j]['cy'] - all_blds[k]['cy']) < eps:
                     used[k] = True
                     queue.append(k)
         yards.append(yard)
+    _notify(f"Усадеб после кластеризации: {len(yards)}", 0.7)
 
+    # --- Фильтр ДХ ---
     households: List[dict] = []
     for yard in yards:
-        bl = [osm_blds[j] for j in yard]
-        main = max(bl, key=lambda b: b['w'] * b['h'])
+        bl = [all_blds[j] for j in yard]
+        main = max(bl, key=lambda b: b['w'] * b['h'] * (1.6 if b['src'] == 'osm' else 1.0))
         if main['w'] * main['h'] * mpp * mpp < P('hh_main_area_m2'):
             continue
         cx = sum(b['cx'] for b in bl) / len(bl)
@@ -743,8 +881,12 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P):
         la, lo = px_to_geo(main['cx'], main['cy'], v['lat'], west, north, mpp)
         households.append(dict(id=len(households) + 1, cx=main['cx'], cy=main['cy'],
                                 lat=round(la, 6), lon=round(lo, 6), n_bld=len(bl),
-                                main_w=main['w'], main_h=main['h'], main_src='osm'))
-    return households
+                                main_w=main['w'], main_h=main['h'], main_src=main['src']))
+    _notify(f"Домохозяйств после фильтра: {len(households)}", 1.0)
+
+    stats = dict(osm=len(osm_blds), cv=len(cv_blds), total_blds=len(all_blds),
+                 yards=len(yards))
+    return households, stats
 
 
 # ----------------------------- BoQ дерево -----------------------------
@@ -1078,7 +1220,8 @@ class GPONPlanner:
         return self.params.get(name, default)
 
     def run(self, village: VillageSpec, progress_cb: Optional[Callable[[str, float], None]] = None,
-            render_map: bool = False, download_tiles: bool = True) -> Dict[str, Any]:
+            render_map: bool = False, download_tiles: bool = True,
+            use_cv_detection: bool = True) -> Dict[str, Any]:
         def _notify(msg, frac=0.0):
             logger.info("[GPON] %s (%.0f%%)", msg, frac * 100)
             if progress_cb:
@@ -1131,10 +1274,36 @@ class GPONPlanner:
         osm_data = dict(bbox=bbox, roads=roads, buildings=buildings, pois=pois,
                         center=[village.lat, village.lon])
 
-        _notify("Детекция домохозяйств (OSM)...", 0.30)
-        households = detect_households(buildings, roads, village.__dict__, bbox, west, north, mpp, W, H, self.P)
-        dev = 100 * (len(households) - village.hh) / max(1, village.hh)
-        _notify(f"Найдено {len(households)} ДХ (заказ {village.hh}, отклонение {dev:+.1f}%)", 0.40)
+        # --- Скачивание спутниковой мозаики (для CV-детекции и/или карты) ---
+        mosaic_rgb = None
+        mosaic_img = None
+        need_mosaic = use_cv_detection or (render_map and download_tiles)
+        if need_mosaic:
+            _notify("Скачиваю спутниковые тайлы Google z18...", 0.26)
+            try:
+                from ftth_renderer import stitch_mosaic
+                cache_dir = os.path.join(self.work_dir, 'tiles')
+                os.makedirs(cache_dir, exist_ok=True)
+                mosaic_img, geo_tiles = stitch_mosaic(
+                    tuple(bbox), 18, cache_dir, village.lat,
+                    progress_cb=lambda m, f: _notify(m, 0.26 + 0.10 * f))
+                geo.update(geo_tiles)
+                mosaic_rgb = np.asarray(mosaic_img)
+                _notify(f"Мозаика {geo['W']}x{geo['H']}px готова", 0.38)
+            except Exception as e:
+                logger.error("Не удалось скачать мозаику: %s. CV выключен.", e)
+                _notify(f"Мозаика недоступна: {e}. CV-детекция пропущена.", 0.38)
+                use_cv_detection = False
+
+        # --- Детекция домохозяйств (OSM + опционально CV) ---
+        cv_label = "OSM + CV" if (use_cv_detection and mosaic_rgb is not None) else "только OSM"
+        _notify(f"Детекция домохозяйств ({cv_label})...", 0.40)
+        households, hh_stats = detect_households(
+            buildings, roads, village.__dict__, bbox, west, north, mpp, W, H, self.P,
+            mosaic_rgb=mosaic_rgb if use_cv_detection else None,
+            progress_cb=lambda m, f: _notify(m, 0.40 + 0.10 * f))
+        _notify(f"Найдено {len(households)} ДХ (OSM зданий: {hh_stats['osm']}, "
+                f"CV крыш: {hh_stats['cv']}, всего построек: {hh_stats['total_blds']})", 0.50)
 
         if not households:
             raise RuntimeError(f"Не найдено ни одного домохозяйства для '{village.name}'.")
@@ -1237,7 +1406,8 @@ class GPONPlanner:
                     network=net, boq=vv, optical_budget=ob, work_dir=self.work_dir,
                     output_dir=maps_dir, cache_tiles_dir=cache_dir,
                     progress_cb=lambda m, f: _notify(m, 0.98 + 0.02 * f),
-                    download_tiles=download_tiles)
+                    download_tiles=download_tiles,
+                    preloaded_mosaic=mosaic_img)
                 _notify(f"Карта сохранена: {map_path}", 1.0)
             except Exception as e:
                 logger.error("Не удалось отрисовать карту: %s", e)
@@ -1247,7 +1417,8 @@ class GPONPlanner:
 
         return dict(village=village.__dict__, bbox=bbox, geo=geo,
                     households=households, anchor_cands=cands[:5], network=net,
-                    boq=vv, optical_budget=ob, map_path=map_path, preview_path=preview_path)
+                    boq=vv, optical_budget=ob, map_path=map_path, preview_path=preview_path,
+                    hh_stats=hh_stats)
 
 
 if __name__ == '__main__':
@@ -1258,18 +1429,21 @@ if __name__ == '__main__':
     ap.add_argument('--lat', type=float, required=True, help='широта центра села')
     ap.add_argument('--lon', type=float, required=True, help='долгота центра села')
     ap.add_argument('--name', default='test', help='имя села (латиницей)')
-    ap.add_argument('--hh', type=int, default=100, help='ожидаемое число ДХ')
     ap.add_argument('--radius', type=float, default=2500.0, help='радиус поиска, м')
     ap.add_argument('--work-dir', default='./gpon_work', help='директория для кэша и результатов')
+    ap.add_argument('--no-cv', action='store_true', help='выключить CV-детекцию крыш')
+    ap.add_argument('--no-map', action='store_true', help='не отрисовывать карту')
     args = ap.parse_args()
     village = VillageSpec(key=args.name, name=args.name, lat=args.lat, lon=args.lon,
-                           hh=args.hh, radius_m=args.radius)
+                           radius_m=args.radius)
     planner = GPONPlanner(work_dir=args.work_dir)
 
     def progress(msg, frac):
         print(f"  [{frac * 100:5.1f}%] {msg}")
 
-    result = planner.run(village, progress_cb=progress)
+    result = planner.run(village, progress_cb=progress,
+                          render_map=not args.no_map,
+                          use_cv_detection=not args.no_cv)
     out_path = os.path.join(args.work_dir, f"{args.name}_result.json")
 
     def _conv(o):
@@ -1288,7 +1462,9 @@ if __name__ == '__main__':
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2, default=_conv)
     print(f"\nГотово! Результат: {out_path}")
-    print(f"  ДХ: {len(result['households'])}")
+    hs = result.get('hh_stats', {})
+    print(f"  ДХ: {len(result['households'])} "
+          f"(OSM: {hs.get('osm', '?')}, CV: {hs.get('cv', '?')}, всего построек: {hs.get('total_blds', '?')})")
     print(f"  муфт: {result['network']['stats']['couplers']}")
     print(f"  магистраль: {result['network']['stats']['feeder_km']} км")
     print(f"  зоны (D): {result['boq']['n_zones']}")
