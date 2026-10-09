@@ -1031,12 +1031,14 @@ class TreeOptimized:
         routes.sort()
         zinfo = [dict(zone='ЦУ (корневая)', root_dist_m=0.0, houses=zone_dh.get(self.root, 0),
                        splitters=spl.get(self.root, 0), feeder_fibers=0,
-                       orsh_ports=next(p2 for p2 in P('orsh_ports_row') if p2 >= zone_dh.get(self.root, 0) * 1.1))]
+                       orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= zone_dh.get(self.root, 0) * 1.1),
+                                         ceilr(zone_dh.get(self.root, 0) * 1.1)))]
         for z in cuts:
             zinfo.append(dict(zone='зонный ОРШ', root_dist_m=round(self.dist[z], 1),
                               houses=zone_dh[z], splitters=spl[z],
                               feeder_fibers=ceilr(P('fiber_reserve') * spl[z]),
-                              orsh_ports=next(p2 for p2 in P('orsh_ports_row_zone') if p2 >= zone_dh[z] * 1.1)))
+                              orsh_ports=next((p2 for p2 in P('orsh_ports_row_zone') if p2 >= zone_dh[z] * 1.1),
+                                                ceilr(zone_dh[z] * 1.1))))
         mufty = self.n_couplers - sum(1 for z in cuts if z in self.coupler_nodes)
         dh = self.dh_total
         spl_total = sum(spl.values())
@@ -1136,7 +1138,7 @@ def boq_centralized(net, mpp, P):
              suspend_kits=math.ceil(total_cable_km * P('suspend_per_km')),
              drop_anchors=P('drop_anchors_per_dh') * dh,
              drop_fix=P('drop_fix_per_dh') * dh,
-             orsh_ports=next(p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1))
+             orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1), ceilr(dh * 1.1)))
     m.update({f'cable_{s}': cable_km.get(str(s), 0.0) for s in std})
     return dict(dhx_served=dh, couplers=len(net['couplers']), mufty=len(net['couplers']),
                 feeder_km=round(feeder_m / 1000, 2), drop_km=round(drop_km, 2),
