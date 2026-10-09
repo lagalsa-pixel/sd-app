@@ -1203,6 +1203,7 @@ class VillageSpec:
     zone_type: str = 'bbox'
     zone_radius: float = 900.0
     bbox_lock: Optional[List[float]] = None
+    polygon_lock: Optional[List[Tuple[float, float]]] = None
     force_anchor: Optional[int] = None
 
 
@@ -1231,8 +1232,15 @@ class GPONPlanner:
                     pass
 
         _notify(f"Загружаю OSM-данные для '{village.name}'...", 0.02)
-        if village.bbox_lock:
+        # Если задан polygon_lock — рассчитываем bbox из его точек
+        if village.polygon_lock and len(village.polygon_lock) >= 3:
+            lats = [p[0] for p in village.polygon_lock]
+            lons = [p[1] for p in village.polygon_lock]
+            probe = (min(lons), min(lats), max(lons), max(lats))
+            _notify(f"Использую границу из полигона ({len(village.polygon_lock)} точек)", 0.05)
+        elif village.bbox_lock:
             probe = tuple(village.bbox_lock)
+            _notify("Использую заданный bbox_lock", 0.05)
         else:
             radius = village.radius_m + self.P('probe_margin_m')
             dlat, dlon = meters_to_deg(radius, village.lat)
@@ -1260,7 +1268,15 @@ class GPONPlanner:
         roads, buildings, pois = osm_features(all_nodes, all_ways)
         _notify(f"OSM: {len(roads)} дорог, {len(buildings)} зданий, {len(pois)} POI", 0.22)
 
-        bbox = (village.bbox_lock or detect_bbox_vectorized(village.lat, village.lon, buildings, probe, self.P))
+        # Определяем итоговый bbox для мозаики и сети
+        if village.polygon_lock and len(village.polygon_lock) >= 3:
+            lats = [p[0] for p in village.polygon_lock]
+            lons = [p[1] for p in village.polygon_lock]
+            bbox = [min(lons), min(lats), max(lons), max(lats)]
+        elif village.bbox_lock:
+            bbox = list(village.bbox_lock)
+        else:
+            bbox = detect_bbox_vectorized(village.lat, village.lon, buildings, probe, self.P)
         w_km = (bbox[2] - bbox[0]) * M_PER_DEG_LAT * math.cos(math.radians(village.lat)) / 1000
         h_km = (bbox[3] - bbox[1]) * M_PER_DEG_LAT / 1000
         _notify(f"Граница села: {w_km:.2f} x {h_km:.2f} км", 0.25)

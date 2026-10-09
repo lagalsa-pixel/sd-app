@@ -498,6 +498,21 @@ class GPONTab(ttk.Frame):
         zf.pack(fill="x", **pad)
         ttk.Radiobutton(zf, text="Bbox (авто-граница по застройке)", variable=self.zone_var, value="bbox").pack(anchor="w")
         ttk.Radiobutton(zf, text="Radius (фиксированный радиус)", variable=self.zone_var, value="radius").pack(anchor="w")
+        # Кнопка задания границы вручную
+        boundary_frame = ttk.LabelFrame(frame, text="Граница населённого пункта")
+        boundary_frame.pack(fill="x", **pad)
+        self.boundary_var = tk.StringVar(value="Авто (по застройке OSM)")
+        ttk.Label(boundary_frame, textvariable=self.boundary_var,
+                  foreground="blue", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=4)
+        bf = ttk.Frame(boundary_frame)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bf, text="🗺 Задать на карте...",
+                   command=self._open_map_picker).pack(side="left")
+        ttk.Button(bf, text="🗑 Сбросить",
+                   command=self._reset_boundary).pack(side="left", padx=4)
+        # Состояние: выбранная граница (bbox + polygon)
+        self.bbox_lock: Optional[list] = None
+        self.polygon_lock: Optional[list] = None
         ttk.Label(frame, text="force_anchor (id OSM, необязательно):").pack(anchor="w", **pad)
         self.force_anchor_var = tk.StringVar(value="")
         ttk.Entry(frame, textvariable=self.force_anchor_var).pack(fill="x", **pad)
@@ -608,6 +623,55 @@ class GPONTab(ttk.Frame):
         else:
             messagebox.showinfo("Кэш", f"Папки нет: {cache_dir}")
 
+    def _open_map_picker(self):
+        """Открыть интерактивный выбор границы на карте."""
+        try:
+            lat = float(self.lat_var.get())
+            lon = float(self.lon_var.get())
+            radius = float(self.radius_var.get())
+        except Exception as e:
+            messagebox.showerror("Ошибка ввода", f"Проверьте координаты: {e}")
+            return
+
+        try:
+            from map_picker import open_map_picker
+            cache_dir = str(config.APP_DIR / "gpon_work" / "tiles")
+            os.makedirs(cache_dir, exist_ok=True)
+            bbox, polygon = open_map_picker(self, lat=lat, lon=lon, radius=radius,
+                                              cache_dir=cache_dir)
+        except ImportError as e:
+            messagebox.showerror("Ошибка", f"Модуль map_picker недоступен: {e}")
+            return
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть карту: {e}")
+            return
+
+        if bbox is None:
+            # Пользователь отменил
+            return
+
+        self.bbox_lock = list(bbox)
+        self.polygon_lock = polygon
+
+        # Обновляем отображение
+        if polygon and len(polygon) > 4:
+            self.boundary_var.set(f"Полигон: {len(polygon)} точек "
+                                  f"({bbox[0]:.4f}–{bbox[2]:.4f}, {bbox[1]:.4f}–{bbox[3]:.4f})")
+        else:
+            self.boundary_var.set(f"Bbox: {bbox[0]:.4f}–{bbox[2]:.4f}, "
+                                  f"{bbox[1]:.4f}–{bbox[3]:.4f}")
+
+        # Переключаем зону на bbox (если был radius)
+        self.zone_var.set("bbox")
+        self.plan_status_var.set("Граница задана вручную. Можно запускать планирование.")
+
+    def _reset_boundary(self):
+        """Сбросить ручную границу — вернуться к авто-определению."""
+        self.bbox_lock = None
+        self.polygon_lock = None
+        self.boundary_var.set("Авто (по застройке OSM)")
+        self.plan_status_var.set("Граница сброшена. Будет авто-определение.")
+
     def _open_output_dir(self):
         import subprocess
         out_dir = config.APP_DIR / "gpon_work"
@@ -642,7 +706,9 @@ class GPONTab(ttk.Frame):
                     s_min_km=float(self.s_min_var.get()),
                     min_zone_dh=int(self.min_zone_var.get()),
                     render_map=bool(self.render_map_var.get()),
-                    use_cv=bool(self.use_cv_var.get()))
+                    use_cv=bool(self.use_cv_var.get()),
+                    bbox_lock=self.bbox_lock,
+                    polygon_lock=self.polygon_lock)
         self._planning = True
         self.plan_button.config(state="disabled")
         self.plan_progress["value"] = 0
@@ -650,7 +716,16 @@ class GPONTab(ttk.Frame):
         self._append_report("header", f"\n=== Запуск планирования: {name} ===\n")
         self._append_report("", f"Координаты: {lat:.4f}, {lon:.4f}\n")
         self._append_report("", f"Радиус поиска: {radius} м, CV: "
-                            f"{'вкл' if task['use_cv'] else 'выкл'}\n\n")
+                            f"{'вкл' if task['use_cv'] else 'выкл'}\n")
+        if self.polygon_lock:
+            self._append_report("", f"Граница: полигон из {len(self.polygon_lock)} точек\n")
+        elif self.bbox_lock:
+            self._append_report("", f"Граница: bbox "
+                                f"{self.bbox_lock[0]:.4f}–{self.bbox_lock[2]:.4f}, "
+                                f"{self.bbox_lock[1]:.4f}–{self.bbox_lock[3]:.4f}\n")
+        else:
+            self._append_report("", "Граница: авто-определение по застройке OSM\n")
+        self._append_report("", "\n")
         self._worker_thread = threading.Thread(target=self._worker, args=(task,), daemon=True)
         self._worker_thread.start()
 
@@ -663,7 +738,9 @@ class GPONTab(ttk.Frame):
             planner.params['min_zone_dh'] = task['min_zone_dh']
             village = VillageSpec(key=task['name'], name=task['name'], lat=task['lat'], lon=task['lon'],
                                    radius_m=task['radius'], zone_type=task['zone_type'],
-                                   zone_radius=900.0, force_anchor=task['force_anchor'])
+                                   zone_radius=900.0, force_anchor=task['force_anchor'],
+                                   bbox_lock=task.get('bbox_lock'),
+                                   polygon_lock=task.get('polygon_lock'))
 
             def progress_cb(msg, frac):
                 self._put("progress", {"msg": msg, "frac": frac})
