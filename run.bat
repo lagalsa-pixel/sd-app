@@ -1,24 +1,28 @@
 @echo off
-chcp 65001 >nul
+REM ============================================================
+REM SD APP - run the application
+REM ============================================================
+REM Double-click this file to start the app
+REM ============================================================
 
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\activate.bat" (
-    echo [ОШИБКА] Виртуальное окружение не найдено.
-    echo Сначала запустите install.bat
+    echo [ERROR] Virtual environment not found.
+    echo Run install.bat first.
     pause
     exit /b 1
 )
 
 call ".venv\Scripts\activate.bat"
 
-echo Запускаю SD Image Generator...
+echo Starting SD App...
 python main.py
 
 if errorlevel 1 (
     echo.
-    echo [ПРИЛОЖЕНИЕ ЗАВЕРШИЛОСЬ С ОШИБКОЙ]
-    echo Смотрите подробности в файле app.log
+    echo [APP EXITED WITH ERROR]
+    echo See app.log for details.
     echo.
     pause
 )

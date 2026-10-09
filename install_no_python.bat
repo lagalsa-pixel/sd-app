@@ -1,50 +1,54 @@
 @echo off
 REM ============================================================
-REM УСТАНОВКА SD APP БЕЗ ПРЕДУСТАНОВЛЕННОГО PYTHON
+REM SD APP INSTALL - for users without Python
 REM ============================================================
-REM Этот скрипт:
-REM   1. Проверяет, есть ли Python
-REM   2. Если нет - скачивает и устанавливает Python 3.12
-REM      (без прав администратора, для текущего пользователя)
-REM   3. Устанавливает все зависимости приложения
-REM   4. Запускает приложение
+REM This script:
+REM   1. Checks if Python is installed
+REM   2. If not - downloads and installs Python 3.12
+REM      (no admin rights needed, for current user)
+REM   3. Installs all app dependencies
+REM   4. Optionally installs SD packages (torch, diffusers)
 REM
-REM Запуск: дважды кликните по этому файлу
-REM Требования: Windows 10 64-bit, интернет
+REM How to run: double-click this file
+REM Requirements: Windows 10 64-bit, internet
 REM ============================================================
 
-chcp 65001 >nul
-
 echo.
 echo ============================================================
-echo   Установка SD App (с автоматической установкой Python)
+echo   SD App Installation (auto Python install)
 echo ============================================================
 echo.
 
-REM Шаг 1: Проверка Python
-echo [1/5] Проверка Python...
+REM Step 1: Check Python
+echo [1/5] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 goto INSTALL_PYTHON
-echo   Python найден:
+echo   Python found:
 python --version
 goto CREATE_VENV
 
 :INSTALL_PYTHON
-echo   Python не найден. Будет установлен.
+echo   Python NOT found. Will install Python 3.12.
 echo.
-echo [2/5] Скачивание Python 3.12...
+echo   NOTE: Do NOT use Python 3.13 or 3.14 - they are too new
+echo   and some packages (numpy, scipy) may not be available yet.
+echo   This script will install Python 3.12 (stable, all packages work).
+echo.
+echo [2/5] Downloading Python 3.12...
 
 set PYTHON_INSTALLER=python-3.12.7-amd64.exe
 set PYTHON_URL=https://www.python.org/ftp/python/3.12.7/%PYTHON_INSTALLER%
 
 if not exist "%PYTHON_INSTALLER%" (
-    echo   Загрузка %PYTHON_INSTALLER% ...
+    echo   Downloading %PYTHON_INSTALLER% ...
     powershell -Command "Invoke-WebRequest -Uri '%PYTHON_URL%' -OutFile '%PYTHON_INSTALLER%'"
     if not exist "%PYTHON_INSTALLER%" (
-        echo   [ОШИБКА] Не удалось скачать Python.
+        echo   [ERROR] Failed to download Python.
         echo.
-        echo Скачайте вручную с https://www.python.org/downloads/
-        echo и установите с галочкой "Add Python to PATH"
+        echo Please download manually from:
+        echo   https://www.python.org/downloads/release/python-3127/
+        echo Scroll down to "Windows installer (64-bit)"
+        echo Install with "Add Python to PATH" checkbox!
         pause
         exit /b 1
     )
@@ -52,19 +56,18 @@ if not exist "%PYTHON_INSTALLER%" (
 echo   OK
 
 echo.
-echo   Установка Python (для текущего пользователя, без прав администратора)...
-echo   Это займёт 1-2 минуты...
+echo   Installing Python (for current user, no admin needed)...
+echo   This takes 1-2 minutes...
 
-REM Простая команда установки без сложных параметров
 "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_tcltk=1
 
-echo   Ожидание завершения установки...
+echo   Waiting for installation to complete...
 :WAIT_PYTHON
 timeout /t 3 /nobreak >nul
 python --version >nul 2>&1
 if errorlevel 1 goto WAIT_PYTHON
 
-echo   Python установлен:
+echo   Python installed:
 python --version
 
 del "%PYTHON_INSTALLER%" 2>nul
@@ -72,11 +75,11 @@ goto CREATE_VENV
 
 :CREATE_VENV
 echo.
-echo [3/5] Создание виртуального окружения...
+echo [3/5] Creating virtual environment...
 if exist ".venv\Scripts\activate.bat" goto ACTIVATE_VENV
 python -m venv .venv
 if errorlevel 1 (
-    echo   [ОШИБКА] Не удалось создать venv.
+    echo   [ERROR] Failed to create venv.
     pause
     exit /b 1
 )
@@ -85,62 +88,67 @@ if errorlevel 1 (
 call ".venv\Scripts\activate.bat"
 echo   OK
 
-REM Шаг 4: Установка зависимостей
+REM Step 4: Install dependencies
 echo.
-echo [4/5] Установка зависимостей...
-echo   Это займёт 5-15 минут (зависит от интернета)...
+echo [4/5] Installing dependencies...
+echo   This takes 5-15 minutes (depends on internet)...
 echo.
 
 python -m pip install --upgrade pip
 
-echo   Устанавливаю базовые пакеты (numpy, scipy, Pillow, requests)...
+echo   Installing base packages (numpy, scipy, Pillow, requests)...
 pip install "numpy>=1.24" "scipy>=1.10" "Pillow>=10.0" "requests>=2.28"
 if errorlevel 1 (
-    echo   [ОШИБКА] Не удалось установить базовые пакеты.
+    echo   [ERROR] Failed to install base packages.
+    echo.
+    echo If you have Python 3.13 or 3.14, packages may not be available.
+    echo Please install Python 3.12 from:
+    echo   https://www.python.org/downloads/release/python-3127/
+    echo Then run this script again.
     pause
     exit /b 1
 )
 
 echo.
-echo   Базовые пакеты установлены. GPON FTTH Planner готов к работе!
+echo   Base packages installed. GPON FTTH Planner is ready!
 echo.
-echo   Хотите установить SD-пакеты (torch, diffusers) для генерации
-echo   изображений через Stable Diffusion? Это дополнительно ~2 ГБ.
+echo   Do you want to install SD packages (torch, diffusers)
+echo   for Stable Diffusion image generation? Additional ~2 GB.
 echo.
-set /p INSTALL_SD="Установить SD-пакеты? (y/n) [n]: "
+set /p INSTALL_SD="Install SD packages? (y/n) [n]: "
 if /i "%INSTALL_SD%"=="y" goto INSTALL_SD
 if /i "%INSTALL_SD%"=="Y" goto INSTALL_SD
-echo   SD-пакеты пропущены. Их можно установить позже через install.bat
+echo   SD packages skipped. You can install later via install.bat
 goto DONE
 
 :INSTALL_SD
 echo.
-echo   Устанавливаю PyTorch (CPU version)...
+echo   Installing PyTorch (CPU version)...
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 echo.
-echo   Устанавливаю diffusers, transformers, accelerate...
+echo   Installing diffusers, transformers, accelerate...
 pip install "diffusers>=0.27" "transformers>=4.38" "accelerate>=0.25"
 if errorlevel 1 (
-    echo   [ПРЕДУПРЕЖДЕНИЕ] Не удалось установить SD-пакеты.
-    echo   SD Generator не будет работать, но GPON Planner будет.
+    echo   [WARNING] Failed to install SD packages.
+    echo   SD Generator won't work, but GPON Planner will.
 ) else (
-    echo   SD-пакеты установлены!
+    echo   SD packages installed!
 )
 
 :DONE
 echo.
-echo [5/5] Готово!
+echo [5/5] Done!
 echo.
 echo ============================================================
-echo   УСТАНОВКА ЗАВЕРШЕНА!
+echo   INSTALLATION COMPLETE!
 echo ============================================================
 echo.
-echo   Для запуска приложения:
-echo   1. Дважды кликните по run.bat
-echo   2. Или выполните в командной строке: python main.py
+echo   To start the app:
+echo   1. Double-click run.bat
+echo   2. Or run: python main.py
 echo.
-echo   Приложение откроется с двумя вкладками:
-echo   - SD Image Generator (если установлены SD-пакеты)
-echo   - GPON FTTH Planner (работает сразу)
+echo   The app has two tabs:
+echo   - SD Image Generator (if SD packages installed)
+echo   - GPON FTTH Planner (works immediately)
 echo.
 pause

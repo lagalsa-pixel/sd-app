@@ -1,40 +1,59 @@
 @echo off
-chcp 65001 >nul
-setlocal EnableDelayedExpansion
+REM ============================================================
+REM SD APP - install dependencies (if Python already installed)
+REM ============================================================
+REM Requires: Python 3.10, 3.11, or 3.12 (NOT 3.13/3.14 - too new)
+REM ============================================================
 
 echo.
-echo === SD Image Generator — Установка ===
+echo ============================================================
+echo   SD App - Installing dependencies
+echo ============================================================
 echo.
 
-where python >nul 2>nul
+REM Check Python
+python --version >nul 2>&1
 if errorlevel 1 (
-    echo [ОШИБКА] Python не найден в PATH.
-    echo Установите Python 3.10+ с https://www.python.org/downloads/windows/
-    echo При установке ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH".
+    echo [ERROR] Python not found.
+    echo Please install Python 3.12 from:
+    echo   https://www.python.org/downloads/release/python-3127/
+    echo Install with "Add Python to PATH" checkbox!
+    echo.
+    echo Or run install_no_python.bat for automatic installation.
     pause
     exit /b 1
 )
 
-echo Найден Python:
+echo Python found:
 python --version
 echo.
 
-set /p gpu="Есть ли у вас GPU NVIDIA? (y/n) [n]: "
-if /i "%gpu%"=="y" (
-    set "TORCH_IDX=cu121"
-) else (
-    set "TORCH_IDX=cpu"
+REM Check version - warn if 3.13+
+python -c "import sys; exit(0 if sys.version_info < (3,13) else 1)" 2>nul
+if errorlevel 1 (
+    echo [WARNING] Python 3.13+ detected.
+    echo Some packages (numpy, scipy) may not have wheels for 3.13/3.14 yet.
+    echo If installation fails, please install Python 3.12 from:
+    echo   https://www.python.org/downloads/release/python-3127/
+    echo.
 )
 
+REM Ask about GPU
+set /p GPU="Do you have NVIDIA GPU? (y/n) [n]: "
+if /i "%GPU%"=="y" set TORCH_IDX=cu121
+if /i "%GPU%"=="Y" set TORCH_IDX=cu121
+if not defined TORCH_IDX set TORCH_IDX=cpu
+
 echo.
-echo Выбран вариант установки: %TORCH_IDX%
+echo Selected install: %TORCH_IDX%
 echo.
 
-if not exist ".venv" (
-    echo Создаю виртуальное окружение .venv ...
+REM Create venv if not exists
+if not exist ".venv\Scripts\activate.bat" (
+    echo Creating virtual environment .venv ...
     python -m venv .venv
     if errorlevel 1 (
-        echo [ОШИБКА] Не удалось создать виртуальное окружение.
+        echo [ERROR] Failed to create venv.
         pause
         exit /b 1
     )
@@ -43,11 +62,11 @@ if not exist ".venv" (
 call ".venv\Scripts\activate.bat"
 
 echo.
-echo Обновляю pip...
+echo Updating pip...
 python -m pip install --upgrade pip
 
 echo.
-echo Устанавливаю PyTorch (%TORCH_IDX%)...
+echo Installing PyTorch (%TORCH_IDX%)...
 if "%TORCH_IDX%"=="cu121" (
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ) else (
@@ -55,17 +74,20 @@ if "%TORCH_IDX%"=="cu121" (
 )
 
 echo.
-echo Устанавливаю остальные зависимости...
+echo Installing other dependencies...
 pip install -r requirements.txt
 
 if "%TORCH_IDX%"=="cu121" (
     echo.
-    echo Устанавливаю xformers (опционально)...
-    pip install xformers || echo [ПРЕДУПРЕЖДЕНИЕ] xformers не установился — это не критично.
+    echo Installing xformers (optional)...
+    pip install xformers 2>nul
 )
 
 echo.
-echo === Установка завершена! ===
-echo Теперь запустите run.bat для старта приложения.
+echo ============================================================
+echo   Installation complete!
+echo ============================================================
+echo.
+echo Now run run.bat to start the app.
 echo.
 pause
