@@ -16,6 +16,7 @@ REM
 REM Запуск: дважды кликните по этому файлу на Windows 10 64-bit
 REM ============================================================
 
+cd /d "%~dp0"
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
 

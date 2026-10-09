@@ -13,10 +13,16 @@ REM How to run: double-click this file
 REM Requirements: Windows 10 64-bit, internet
 REM ============================================================
 
+REM Change to script directory (critical!)
+cd /d "%~dp0"
+
 echo.
 echo ============================================================
 echo   SD App Installation (auto Python install)
 echo ============================================================
+echo.
+echo Current directory:
+cd
 echo.
 
 REM Step 1: Check Python
