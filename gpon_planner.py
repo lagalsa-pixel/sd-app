@@ -680,7 +680,9 @@ def build_network_optimized(osm_data, hhs, anchor, geo, P, bounds=None, progress
                 feeder_edges=[[[float(Pt64[e[0]][0]), float(Pt64[e[0]][1])],
                                 [float(Pt64[e[1]][0]), float(Pt64[e[1]][1])]]
                                for e in sorted(feeder_edges)],
-                drops=drops, stats=stats)
+                drops=drops, stats=stats,
+                road_Pt=Pt64,
+                road_pred=pred_m[0])
 
 
 # ----------------------------- ЦУ -----------------------------
@@ -1366,6 +1368,60 @@ class GPONPlanner:
             else:
                 zgeo = dict(px=None, lat=None, lon=None)
             zones_geo.append({**zdata, **zgeo})
+
+        # --- Фидерные трассы ЦУ → зонный ОРШ по дорожному графу ---
+        # Используем pred_m[0] (предшественники от корня в полном дорожном графе)
+        # для прокладки кратчайшего пути вдоль дорог, а не по прямой.
+        road_Pt = net.get('road_Pt')
+        road_pred = net.get('road_pred')
+        root_int = net['root_node']
+        ax_px, ay_px = net['anchor']['x'], net['anchor']['y']
+
+        # Обратное отображение: nkey → int индекс узла дорожного графа
+        nkey_to_int = {}
+        for c in net['couplers']:
+            nk = nkey([c['x'], c['y']])
+            nkey_to_int[nk] = c['node']
+
+        feeder_paths = []  # список путей в пикселях: [[x,y], ...]
+        # Зона 0 = ЦУ: путь — одна точка (сам ЦУ)
+        feeder_paths.append([[ax_px, ay_px]])
+
+        for z in cuts:
+            node_int = nkey_to_int.get(z)
+            if (node_int is None or road_Pt is None or road_pred is None
+                    or node_int >= len(road_pred)):
+                # Fallback: прямая линия от ЦУ до ОРШ
+                zxy = cpos.get(z)
+                if zxy:
+                    feeder_paths.append([[ax_px, ay_px], list(zxy)])
+                else:
+                    feeder_paths.append(None)
+                continue
+
+            # Трассируем путь от node_int к root_int по предшественникам
+            path_nodes = [node_int]
+            cur = node_int
+            guard = 0
+            while cur != root_int and guard < len(road_pred):
+                p = int(road_pred[cur])
+                if p < 0:
+                    break
+                path_nodes.append(p)
+                cur = p
+                guard += 1
+
+            # Конвертируем в пиксели, добавляем ЦУ в начало для замыкания
+            path_px = [[ax_px, ay_px]]
+            for n in reversed(path_nodes):
+                if n < len(road_Pt):
+                    path_px.append([float(road_Pt[n][0]), float(road_Pt[n][1])])
+            feeder_paths.append(path_px)
+
+        net['feeder_paths'] = feeder_paths
+        # Удаляем большие numpy-массивы — они не нужны в JSON-результате
+        net.pop('road_Pt', None)
+        net.pop('road_pred', None)
 
         cable_km = {str(s): roundup01(r['km_by_size'].get(str(s), 0.0) * self.P('cable_stock'))
                     for s in self.P('std_fibers') if r['km_by_size'].get(str(s), 0.0) > 0}

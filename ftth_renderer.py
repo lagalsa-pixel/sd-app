@@ -367,12 +367,20 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
             col = C_TRUNK if zi == 0 else zcolor[zi] + (235,)
             dr.line([(x1, y1), (x2, y2)], fill=col, width=trunk_w)
 
+    # Фидерные трассы ЦУ→ОРШ: пунктир по реальным путям вдоль дорог
+    feeder_paths = network.get('feeder_paths', [])
     for i in range(1, len(zones_layout)):
         zxy = zones_layout[i].get('px')
         if not zxy:
             continue
-        ax, ay = network['anchor']['x'], network['anchor']['y']
-        draw_dashed(dr, [(ax, ay), (zxy[0], zxy[1])], zcolor[i] + (215,),
+        # Используем реальный путь по дорогам, если доступен
+        if i < len(feeder_paths) and feeder_paths[i] and len(feeder_paths[i]) >= 2:
+            path_pts = [(p[0], p[1]) for p in feeder_paths[i]]
+        else:
+            # Fallback: прямая линия от ЦУ до ОРШ
+            ax, ay = network['anchor']['x'], network['anchor']['y']
+            path_pts = [(ax, ay), (zxy[0], zxy[1])]
+        draw_dashed(dr, path_pts, zcolor[i] + (215,),
                      max(5, round(6 * k)), phase=i * (DASH + GAP) / 2.0)
 
     for c in network['couplers']:
