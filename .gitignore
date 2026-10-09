@@ -61,8 +61,16 @@ sd_app.egg-info/
 
 # Build artifacts (PyInstaller)
 *.spec
+build/
+dist/
 build_exe/
 dist_exe/
+
+# Portable build artifacts
+sd-app-portable/
+sd-app-portable.zip
+python-3.*-embed-amd64.zip
+get-pip.py
 
 # Test artifacts
 .pytest_cache/

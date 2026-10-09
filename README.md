@@ -48,7 +48,18 @@
 
 ## Быстрый старт
 
-### Вариант A: install.bat + run.bat (рекомендуется)
+### 🚀 Вариант 0: Portable-версия (без установки Python!)
+
+**Самый простой способ** — не требует установки Python на ПК.
+
+1. Скачайте `sd-app-portable.zip` со страницы [Releases](../../releases)
+2. Распакуйте в любую папку (или на USB-флешку)
+3. Запустите **`sd-app-portable.bat`** двойным кликом
+4. Готово! Приложение откроется без установки
+
+Размер: ~80 МБ (GPON работает сразу; SD-пакеты установятся по запросу)
+
+### Вариант A: install.bat + run.bat (рекомендуется для разработчиков)
 
 1. Установите Python 3.10+ с https://www.python.org/downloads/windows/
    **ВАЖНО:** при установке отметьте галочку **"Add Python to PATH"**.
@@ -147,8 +158,11 @@ sd-app/
 ├── pyproject.toml     # Метаданные пакета (PEP 517/518)
 ├── install.bat        # Установка (Windows)
 ├── run.bat            # Запуск (Windows)
-├── build_exe.bat      # Сборка .exe (Windows)
+├── build_portable.bat # 🆕 Сборка portable-версии (Windows, без Python)
+├── build_exe.bat      # Сборка .exe через PyInstaller (Windows)
+├── portable_launcher.bat  # 🆕 Запуск portable-версии
 ├── README.md          # Этот файл
+├── PORTABLE_README.md # 🆕 Инструкция по portable-версии
 ├── LICENSE            # MIT лицензия
 ├── CONTRIBUTING.md    # Инструкции для контрибьюторов
 ├── .gitignore         # Git ignore patterns
