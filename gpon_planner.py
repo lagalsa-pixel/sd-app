@@ -424,13 +424,16 @@ def build_network_optimized(osm_data, hhs, anchor, geo, P, bounds=None, progress
                 pass
 
     _notify("Строю дорожный граф...", 0.05)
+    import time as _time
+    _t0 = _time.time()
     builder = RoadGraphBuilder(mpp, P('net_densify_m'))
     graph = builder.build(osm_data['roads'], west, north, bounds)
     Pt, tree, C, allowed = graph['P'], graph['kdt'], graph['C'], graph['allowed']
     n = len(Pt)
-    logger.info("Граф: %d узлов, %d рёбер", n, C.nnz // 2)
+    _t1 = _time.time()
+    logger.info("Граф: %d узлов, %d рёбер [%.1f сек]", n, C.nnz // 2, _t1 - _t0)
 
-    _notify(f"Граф готов: {n} узлов. Привязка ДХ...", 0.15)
+    _notify(f"Граф готов: {n} узлов, {C.nnz // 2} рёбер [{_t1 - _t0:.1f} сек]. Привязка ДХ...", 0.15)
     root_id = int(tree.query([ax, ay])[1]) if tree is not None else 0
     hh_nodes: List[Optional[int]] = []
     snap_d: List[float] = []
@@ -450,8 +453,11 @@ def build_network_optimized(osm_data, hhs, anchor, geo, P, bounds=None, progress
     terminals = list(dict.fromkeys([root_id] + [hh_nodes[i] for i in ok]))
     tpos = {t: i for i, t in enumerate(terminals)}
 
-    _notify("Считаю кратчайшие пути (Dijkstra)...", 0.25)
+    _notify(f"Считаю кратчайшие пути (Dijkstra) для {len(terminals)} терминалов...", 0.25)
+    _t0 = _time.time()
     Dm, pred_m = dijkstra(C, indices=terminals, return_predecessors=True, directed=False)
+    _t1 = _time.time()
+    _notify(f"Dijkstra завершён: {len(terminals)} терминалов [{_t1 - _t0:.1f} сек]", 0.35)
 
     K = len(terminals)
     Dt = np.array([[Dm[i][t] for t in terminals] for i in range(K)], dtype=np.float32)
@@ -668,7 +674,9 @@ def build_network_optimized(osm_data, hhs, anchor, geo, P, bounds=None, progress
                  avg_drop_m=round(drop_m / max(1, len(drops)), 1),
                  max_drop_m=round(max((dd['length_m'] for dd in drops), default=0), 1))
 
-    _notify("Сеть построена.", 1.0)
+    _t2 = _time.time()
+    _notify(f"Сеть построена: {stats['served']} ДХ, {stats['couplers']} муфт, "
+            f"{stats['feeder_km']} км магистрали [{_t2 - _t0:.1f} сек всего]", 1.0)
     logger.info("ОРШ id=%s; обслужено %d/%d ДХ; муфт %d; магистраль %.2f км",
                 anchor.get('id'), stats['served'], len(hhs), stats['couplers'], stats['feeder_km'])
 

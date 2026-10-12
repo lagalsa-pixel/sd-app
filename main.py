@@ -743,9 +743,17 @@ class GPONTab(ttk.Frame):
                                    polygon_lock=task.get('polygon_lock'))
 
             def progress_cb(msg, frac):
+                # Print to console (CMD window) for real-time monitoring
+                print(f"  [{frac * 100:5.1f}%] {msg}", flush=True)
+                # Log to file
+                logger.info("[GPON] %s (%.0f%%)", msg, frac * 100)
+                # Update GUI progress bar
                 self._put("progress", {"msg": msg, "frac": frac})
+                # Log key milestones to report panel
                 if any(kw in msg.lower() for kw in ['osm:', 'найдено', 'сеть:', 'boq:', 'бюджет', 'граница', 'цу:',
-                                                     'cv:', 'мозаика', 'космоснимку']):
+                                                     'cv:', 'мозаика', 'космоснимку', 'скачиваю',
+                                                     'граф', 'dijkstra', 'муфт', 'дроп',
+                                                     'карта сохранена', 'зон']):
                     self._put("log", msg)
 
             result = planner.run(village, progress_cb=progress_cb,
