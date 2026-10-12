@@ -1,10 +1,19 @@
 """
 ftth_renderer.py — отрисовка карты сети FTTH (схема D) на спутниковой мозаике.
 
-Реализует те же слои, что и оригинальный ftth_outputs.py, но через
-Pillow (без OpenCV). Слои: зоны (выпуклые оболочки), дропы, ствол, фидеры
-(пунктир), муфты, ДХ, зонные ОРШ, ЦУ + легенда с авто-размещением +
-масштабная линейка + стрелка севера.
+Реализует те же слои, что и оригинальный `ftth_outputs.py`, но через
+Pillow (без OpenCV) и со следующими упрощениями:
+  - скачивание тайлов Google Satellite z18 (через requests, с кэшем);
+  - слои: зоны (выпуклые оболочки), дропы, ствол, фидеры (пунктир),
+    муфты, ДХ, зонные ОРШ, ЦУ;
+  - легенда с авто-размещением по минимуму перекрытий;
+  - масштабная линейка, стрелка севера, шапка со статистикой.
+
+Сохраняет:
+  - `<key>_зоны_ОРШ.jpg` (полное разрешение, q90);
+  - `<key>_preview.png` (1800 px для предпросмотра в UI).
+
+Используется из gpon_planner.py (вызывается после stage boq).
 """
 from __future__ import annotations
 
@@ -22,26 +31,31 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
+
+# Константы
 GOOGLE_TILE = 'https://mt{m}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}'
 GUA = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                      '(KHTML, like Gecko) Chrome/120.0 Safari/537.36',
        'Referer': 'https://www.google.com/maps'}
+
 M_PER_DEG_LAT = 111320.0
 
-C_DROP = (255, 225, 0, 225)
-C_COUP = (0, 255, 225, 255)
+# Стиль (как в оригинале)
+C_DROP = (255, 225, 0, 225)         # жёлтый — дропы
+C_COUP = (0, 255, 225, 255)         # бирюзовый — муфты
 C_COUP_OUT = (0, 60, 60, 255)
-C_TRUNK = (215, 225, 240, 235)
+C_TRUNK = (215, 225, 240, 235)      # серо-белый — ствол
 C_HH_OUT = (25, 25, 25, 255)
-C_CU = (224, 49, 49)
+C_CU = (224, 49, 49)                # красный — ЦУ
 PALETTE = [
     (25, 113, 194), (47, 158, 68), (240, 140, 0), (156, 54, 181),
     (12, 133, 153), (230, 73, 128), (102, 168, 15), (112, 72, 232),
     (160, 90, 44),
 ]
-HH_HDR = 150
-DASH, GAP = 30, 22
+HH_HDR = 150                        # высота шапки
+DASH, GAP = 30, 22                  # пунктир фидера
 
+# Шрифты (пробуем несколько вариантов для Linux/Windows)
 _FONT_PATHS_BOLD = [
     '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
     '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
@@ -56,7 +70,8 @@ _FONT_PATHS_REG = [
 ]
 
 
-def _find_font(bold=True):
+def _find_font(bold: bool = True) -> Optional[str]:
+    """Найти доступный TTF-шрифт."""
     paths = _FONT_PATHS_BOLD if bold else _FONT_PATHS_REG
     for p in paths:
         if os.path.exists(p):
@@ -68,37 +83,48 @@ _FB = _find_font(bold=True)
 _FR = _find_font(bold=False)
 
 
-def fnt(sz, bold=True):
+def fnt(sz: int, bold: bool = True) -> ImageFont.FreeTypeFont:
+    """Получить шрифт заданного размера."""
     path = _FB if bold else (_FR or _FB)
     if path:
         try:
             return ImageFont.truetype(path, sz)
         except Exception:
             pass
+    # Fallback на дефолт
     return ImageFont.load_default()
 
 
-def lon2tx(lon, z): return (lon + 180.0) / 360.0 * (1 << z)
+# ----------------------------------------------------------------------------
+# Утилиты для Web Mercator и тайлов
+# ----------------------------------------------------------------------------
+def lon2tx(lon: float, z: int) -> float:
+    return (lon + 180.0) / 360.0 * (1 << z)
 
 
-def lat2ty(lat, z):
+def lat2ty(lat: float, z: int) -> float:
     lr = math.radians(lat)
     return (1.0 - math.log(math.tan(lr) + 1.0 / math.cos(lr)) / math.pi) / 2.0 * (1 << z)
 
 
-def tx2lon(x, z): return x / (1 << z) * 360.0 - 180.0
+def tx2lon(x: float, z: int) -> float:
+    return x / (1 << z) * 360.0 - 180.0
 
 
-def ty2lat(y, z):
+def ty2lat(y: float, z: int) -> float:
     n = math.pi * (1.0 - 2.0 * y / (1 << z))
     return math.degrees(math.atan(math.sinh(n)))
 
 
-def m_per_px(lat, z):
+def m_per_px(lat: float, z: int) -> float:
     return 156543.03392 * math.cos(math.radians(lat)) / (1 << z)
 
 
-def fetch_tile(z, x, y, cache_dir):
+# ----------------------------------------------------------------------------
+# Скачивание тайлов
+# ----------------------------------------------------------------------------
+def fetch_tile(z: int, x: int, y: int, cache_dir: str) -> Optional[bytes]:
+    """Скачать тайл Google Satellite с дисковым кэшем."""
     p = os.path.join(cache_dir, f'g{z}', str(x), f'{y}.jpg')
     os.makedirs(os.path.dirname(p), exist_ok=True)
     if os.path.exists(p):
@@ -111,6 +137,7 @@ def fetch_tile(z, x, y, cache_dir):
     except ImportError:
         logger.error("requests не установлен — не могу скачать тайлы")
         return None
+
     for attempt in range(3):
         try:
             r = requests.get(GOOGLE_TILE.format(m=(x + y) % 4, z=z, x=x, y=y),
@@ -128,7 +155,15 @@ def fetch_tile(z, x, y, cache_dir):
     return None
 
 
-def stitch_mosaic(bbox, z, cache_dir, lat_mid, progress_cb=None):
+def stitch_mosaic(bbox: Tuple[float, float, float, float], z: int,
+                   cache_dir: str, lat_mid: float,
+                   progress_cb: Optional[Callable[[str, float], None]] = None
+                   ) -> Tuple[Image.Image, Dict[str, Any]]:
+    """Собрать мозаику из тайлов Google Satellite по bbox.
+
+    bbox: (lon_min, lat_min, lon_max, lat_max)
+    Возвращает (PIL.Image, geo_dict), где geo_dict содержит west/north/mpp/W/H.
+    """
     lon_min, lat_min, lon_max, lat_max = bbox
     tx0f, tx1f = lon2tx(lon_min, z), lon2tx(lon_max, z)
     ty0f, ty1f = lat2ty(lat_max, z), lat2ty(lat_min, z)
@@ -137,12 +172,16 @@ def stitch_mosaic(bbox, z, cache_dir, lat_mid, progress_cb=None):
     offx, offy = (tx0f - x0) * 256, (ty0f - y0) * 256
     Wpx, Hpx = int(round((tx1f - tx0f) * 256)), int(round((ty1f - ty0f) * 256))
     tiles = [(tx, ty) for tx in range(x0, x1) for ty in range(y0, y1)]
+
     if progress_cb:
         progress_cb(f"Скачиваю {len(tiles)} тайлов Google z{z}...", 0.0)
+
     tilemap = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for (tx, ty), data in ex.map(lambda t: (t, fetch_tile(z, t[0], t[1], cache_dir)), tiles):
+        for (tx, ty), data in ex.map(
+                lambda t: (t, fetch_tile(z, t[0], t[1], cache_dir)), tiles):
             tilemap[(tx, ty)] = data
+
     canvas = Image.new('RGB', ((x1 - x0) * 256, (y1 - y0) * 256), (40, 40, 40))
     missing = 0
     total = len(tiles)
@@ -157,17 +196,25 @@ def stitch_mosaic(bbox, z, cache_dir, lat_mid, progress_cb=None):
         else:
             missing += 1
         if progress_cb and i % 10 == 0:
-            progress_cb(f"Сборка мозаики: {i + 1}/{total} тайлов", 0.3 + 0.5 * (i + 1) / max(1, total))
+            progress_cb(f"Сборка мозаики: {i + 1}/{total} тайлов",
+                        0.3 + 0.5 * (i + 1) / max(1, total))
+
+    # Обрезаем до точного bbox
     mos = canvas.crop((int(offx), int(offy), int(offx) + Wpx, int(offy) + Hpx))
+
     mpp = m_per_px(lat_mid, z)
-    geo = dict(west=tx2lon(tx0f, z), north=ty2lat(ty0f, z), mpp=mpp, W=Wpx, H=Hpx,
-                zoom=z, missing=missing, bbox=list(bbox))
+    geo = dict(west=tx2lon(tx0f, z), north=ty2lat(ty0f, z),
+                mpp=mpp, W=Wpx, H=Hpx, zoom=z, missing=missing, bbox=list(bbox))
     if progress_cb:
         progress_cb(f"Мозаика {Wpx}x{Hpx}px готова", 0.8)
     return mos, geo
 
 
-def hull(points):
+# ----------------------------------------------------------------------------
+# Геометрия
+# ----------------------------------------------------------------------------
+def hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Выпуклая оболочка (monotone chain)."""
     pts = sorted(set((round(x, 1), round(y, 1)) for x, y in points))
     if len(pts) < 3:
         return [tuple(p) for p in pts]
@@ -188,7 +235,9 @@ def hull(points):
     return lower[:-1] + upper[:-1]
 
 
-def draw_dashed(dr, pts, fill, width, phase=0.0):
+def draw_dashed(dr: ImageDraw.ImageDraw, pts: List[Tuple[float, float]],
+                 fill: Tuple, width: int, phase: float = 0.0) -> None:
+    """Пунктирная линия по ломаной."""
     seg = DASH + GAP
     g = 0.0
     for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
@@ -196,44 +245,68 @@ def draw_dashed(dr, pts, fill, width, phase=0.0):
         if L < 1e-9:
             continue
         g0, g1 = g, g + L
-        for k in range(int(math.floor((g0 - phase) / seg)) - 1, int(math.ceil((g1 - phase) / seg)) + 1):
+        for k in range(int(math.floor((g0 - phase) / seg)) - 1,
+                        int(math.ceil((g1 - phase) / seg)) + 1):
             a = max(g0, k * seg + phase)
             b = min(g1, k * seg + phase + DASH)
             if b > a:
                 t0, t1 = (a - g0) / L, (b - g0) / L
                 dr.line([(x1 + (x2 - x1) * t0, y1 + (y2 - y1) * t0),
-                          (x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1)], fill=fill, width=width)
+                          (x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1)],
+                         fill=fill, width=width)
         g += L
 
 
-def draw_orsh(dr, x, y, s, col, num):
+# ----------------------------------------------------------------------------
+# Маркеры ОРШ и ЦУ (упрощённая версия из sym50)
+# ----------------------------------------------------------------------------
+def draw_orsh(dr: ImageDraw.ImageDraw, x: float, y: float, s: float,
+               col: Tuple[int, int, int], num: int) -> None:
+    """Нарисовать зонный ОРШ (шкаф с номером зоны)."""
+    # Корпус шкафа
     dr.rectangle([x - s, y - int(s * 1.5), x + s, y + int(s * 1.5)],
                   fill=(40, 50, 60, 255), outline=col, width=max(2, int(s / 6)))
+    # Номер зоны
     f = fnt(max(10, int(s * 0.9)))
     txt = str(num)
     tw = dr.textlength(txt, font=f)
     dr.text((x - tw / 2, y - f.size / 2), txt, font=f, fill=(255, 255, 255, 255))
 
 
-def draw_olt_node(dr, x, y, s):
-    dr.rectangle([x - s, y - s, x + s, y + s], fill=(140, 30, 30, 255),
-                  outline=(255, 255, 255, 255), width=max(2, int(s / 6)))
-    dr.line([(x, y - s), (x, y - s * 2.2)], fill=(255, 255, 255, 255), width=max(2, int(s / 5)))
-    dr.line([(x - s * 0.6, y - s * 1.6), (x, y - s * 2.2)], fill=(255, 255, 255, 255), width=max(2, int(s / 6)))
-    dr.line([(x + s * 0.6, y - s * 1.6), (x, y - s * 2.2)], fill=(255, 255, 255, 255), width=max(2, int(s / 6)))
+def draw_olt_node(dr: ImageDraw.ImageDraw, x: float, y: float, s: float) -> None:
+    """Нарисовать ЦУ (здание + антенна + бейдж OLT)."""
+    # Здание
+    dr.rectangle([x - s, y - s, x + s, y + s],
+                  fill=(140, 30, 30, 255), outline=(255, 255, 255, 255),
+                  width=max(2, int(s / 6)))
+    # Антенна
+    dr.line([(x, y - s), (x, y - s * 2.2)], fill=(255, 255, 255, 255),
+             width=max(2, int(s / 5)))
+    dr.line([(x - s * 0.6, y - s * 1.6), (x, y - s * 2.2)],
+             fill=(255, 255, 255, 255), width=max(2, int(s / 6)))
+    dr.line([(x + s * 0.6, y - s * 1.6), (x, y - s * 2.2)],
+             fill=(255, 255, 255, 255), width=max(2, int(s / 6)))
+    # Бейдж OLT
     f = fnt(max(10, int(s * 0.55)))
     txt = 'OLT'
     tw = dr.textlength(txt, font=f)
     dr.rectangle([x - tw / 2 - 4, y - s * 2.6, x + tw / 2 + 4, y - s * 2.2],
-                  fill=(180, 0, 0, 255), outline=(255, 255, 255, 255), width=1)
+                  fill=(180, 0, 0, 255), outline=(255, 255, 255, 255),
+                  width=1)
     dr.text((x - tw / 2, y - s * 2.55), txt, font=f, fill=(255, 255, 255, 255))
 
 
+# ----------------------------------------------------------------------------
+# Размещение подписей без наложений
+# ----------------------------------------------------------------------------
 class Labels:
+    """Жадное размещение подписей — 8 кандидатов, проверка перекрытий."""
+
     def __init__(self):
         self.boxes: List[Tuple[float, float, float, float]] = []
 
-    def place(self, x, y, tw, th, W, H, pad=14):
+    def place(self, x: float, y: float, tw: int, th: int,
+              W: int, H: int, pad: int = 14) -> Optional[Tuple[float, float]]:
         for dx, dy in ((pad, -th - pad), (-tw - pad, -th - pad), (pad, pad),
                         (-tw - pad, pad), (pad, -th // 2), (-tw - pad, -th // 2),
                         (0, -th - 2 * pad), (0, pad + 4)):
@@ -241,17 +314,21 @@ class Labels:
             if bx < 8 or by < 8 or bx + tw > W - 8 or by + th > H - 8:
                 continue
             box = (bx - 6, by - 6, bx + tw + 6, by + th + 6)
-            if any(box[0] < b[2] and box[2] > b[0] and box[1] < b[3] and box[3] > b[1] for b in self.boxes):
+            if any(box[0] < b[2] and box[2] > b[0] and
+                    box[1] < b[3] and box[3] > b[1] for b in self.boxes):
                 continue
             self.boxes.append(box)
             return bx, by
         return None
 
 
-def legend_weight(rect, hh_pts, coup_pts, orsh_pts, cu_pt):
+def legend_weight(rect: Tuple, hh_pts: List, coup_pts: List,
+                   orsh_pts: List, cu_pt: Optional[Tuple]) -> int:
+    """Вес перекрытия легенды (меньше = лучше)."""
     x0, y0, x1, y1 = rect
     w = 0
-    for (x, y), k in [(p, 1) for p in hh_pts] + [(p, 2) for p in coup_pts] + [(p, 20) for p in orsh_pts]:
+    for (x, y), k in [(p, 1) for p in hh_pts] + [(p, 2) for p in coup_pts] + \
+                       [(p, 20) for p in orsh_pts]:
         if x0 - 8 <= x <= x1 + 8 and y0 - 8 <= y <= y1 + 8:
             w += k
     if cu_pt and x0 - 20 <= cu_pt[0] <= x1 + 20 and y0 - 20 <= cu_pt[1] <= y1 + 20:
@@ -259,20 +336,31 @@ def legend_weight(rect, hh_pts, coup_pts, orsh_pts, cu_pt):
     return w
 
 
-def render_network_map(village, bbox, geo, households, network, boq, optical_budget,
-                       work_dir, output_dir, cache_tiles_dir,
-                       progress_cb=None, download_tiles=True,
-                       preloaded_mosaic=None):
-    """Отрисовать карту сети FTTH (схема D) на спутниковой мозаике.
-
-    Если preloaded_mosaic (PIL.Image) передан — используется он вместо
-    повторного скачивания/сборки тайлов.
+# ----------------------------------------------------------------------------
+# Главная функция рендеринга
+# ----------------------------------------------------------------------------
+def render_network_map(
+    village: dict,
+    bbox: List[float],
+    geo: Dict[str, Any],
+    households: List[dict],
+    network: Dict[str, Any],
+    boq: Dict[str, Any],
+    optical_budget: Dict[str, Any],
+    work_dir: str,
+    output_dir: str,
+    cache_tiles_dir: str,
+    progress_cb: Optional[Callable[[str, float], None]] = None,
+    download_tiles: bool = True,
+) -> Tuple[str, str]:
+    """
+    Отрисовать карту сети FTTH (схема D) на спутниковой мозаике.
 
     Возвращает (jpg_path, preview_path).
     """
     t0 = time.time()
 
-    def _notify(msg, frac=0.0):
+    def _notify(msg: str, frac: float = 0.0):
         logger.info("[render] %s (%.0f%%)", msg, frac * 100)
         if progress_cb:
             try:
@@ -280,15 +368,14 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
             except Exception:
                 pass
 
-    if preloaded_mosaic is not None:
-        _notify("Использую предзагруженную мозаику...", 0.0)
-        base = preloaded_mosaic.convert('RGB') if hasattr(preloaded_mosaic, 'convert') else preloaded_mosaic
-    elif download_tiles:
+    # === 1. Базовый снимок: скачиваем мозаику тайлов ===
+    if download_tiles:
         _notify("Скачиваю спутниковые тайлы Google z18...", 0.0)
         try:
             base, geo_tiles = stitch_mosaic(tuple(bbox), 18, cache_tiles_dir,
                                               (bbox[1] + bbox[3]) / 2,
                                               progress_cb=lambda m, f: _notify(m, 0.05 + 0.30 * f))
+            # Обновим geo из мозаики
             geo.update(geo_tiles)
         except Exception as e:
             logger.error("Не удалось скачать мозаику: %s. Использую белый фон.", e)
@@ -302,18 +389,29 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
     mpp = geo['mpp']
     _notify(f"Базовое изображение: {W}x{H}px", 0.40)
 
+    # === 2. Разбиение на зоны (используем уже посчитанное из boq) ===
+    # boq['zones'] = [{zone, root_dist_m, houses, splitters, feeder_fibers,
+    #                  orsh_ports, px, lat, lon}, ...]
+    # zone 0 = ЦУ (корневая), зоны 1..N = зонные ОРШ (по cuts)
     zones_layout = boq.get('zones', [])
     cuts_count = len(zones_layout) - 1 if zones_layout else 0
     _notify(f"Зон: {cuts_count} + ЦУ", 0.45)
 
+    # Определим, какие ДХ относятся к каким зонам — через coupler → zone
+    # В нашем boq['zones'] нет прямого соответствия node→zone, поэтому
+    # используем эвристику: ближайший ОРШ к ДХ = его зона.
+    # (Это упрощение; в оригинале используется zr[node] из t.flows.)
     zone_centers = []
     for i, z in enumerate(zones_layout):
         if z.get('px'):
             zone_centers.append((i, z['px'][0], z['px'][1]))
         else:
-            zone_centers.append((i, network['anchor']['x'], network['anchor']['y']))
+            # Для ЦУ используем координату anchor
+            zone_centers.append((i, network['anchor']['x'],
+                                  network['anchor']['y']))
 
-    def zone_of_drop(drop_poly_last_pt):
+    def zone_of_drop(drop_poly_last_pt: Tuple[float, float]) -> int:
+        """Найти индекс зоны для ДХ по ближайшему ОРШ."""
         if not zone_centers:
             return 0
         x, y = drop_poly_last_pt
@@ -324,71 +422,80 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
                 best_d, best_z = d, zi
         return best_z
 
+    # Цвета зон
     zcolor = {0: C_CU}
     zname = {0: 'ЦУ'}
     for i in range(1, len(zones_layout)):
         zcolor[i] = PALETTE[(i - 1) % len(PALETTE)]
         zname[i] = f'ОРШ-{i}'
 
+    # Точки ДХ по зонам (для выпуклых оболочек)
     zpts: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
     for d in network['drops']:
         if d['poly']:
             last = d['poly'][-1]
             zi = zone_of_drop(last)
             zpts[zi].append(last)
+    # Добавляем муфты и ОРШ
     for c in network['couplers']:
         zi = zone_of_drop((c['x'], c['y']))
         zpts[zi].append((c['x'], c['y']))
     for zi, _, zx, zy in [(zc[0], None, zc[1], zc[2]) for zc in zone_centers]:
         zpts[zi].append((zx, zy))
 
+    # === 3. Рендеринг слоёв ===
     _notify("Рисую слои сети...", 0.50)
     ov = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     dr = ImageDraw.Draw(ov)
-    k = 1.0
+    k = 1.0  # масштаб маркеров (без пользовательского кадра — 1.0)
     lw = max(2, round(2 * k))
     trunk_w = max(5, round(5 * k))
 
+    # Слой 1: выпуклые оболочки зон (полупрозрачные заливки)
     for zi in range(len(zones_layout)):
         col = zcolor[zi]
         hp = hull(zpts.get(zi, []))
         if len(hp) >= 3:
-            dr.polygon(hp, fill=col + (38,), outline=col + (170,), width=max(3, round(4 * k)))
+            dr.polygon(hp, fill=col + (38,), outline=col + (170,),
+                         width=max(3, round(4 * k)))
 
+    # Слой 2: дропы (жёлтые)
     for d in network['drops']:
         poly = d['poly']
         if len(poly) >= 2:
             dr.line([(p[0], p[1]) for p in poly], fill=C_DROP, width=lw)
 
+    # Слой 3: ствол сети (серый) + фидерные рёбра цвета зоны
     for e in network['feeder_edges']:
+        # e = [[x1, y1], [x2, y2]]
         if len(e) >= 2:
             (x1, y1), (x2, y2) = e[0], e[1]
+            # Определим зону по ближайшему ОРШ
             zi = zone_of_drop(((x1 + x2) / 2, (y1 + y2) / 2))
             col = C_TRUNK if zi == 0 else zcolor[zi] + (235,)
             dr.line([(x1, y1), (x2, y2)], fill=col, width=trunk_w)
 
-    # Фидерные трассы ЦУ→ОРШ: пунктир по реальным путям вдоль дорог
-    feeder_paths = network.get('feeder_paths', [])
+    # Слой 4: фидеры (пунктир) — в упрощённой версии нет отдельных фидерных
+    # трасс, поэтому рисуем линии от ЦУ до каждого зонного ОРШ
     for i in range(1, len(zones_layout)):
         zxy = zones_layout[i].get('px')
         if not zxy:
             continue
-        # Используем реальный путь по дорогам, если доступен
-        if i < len(feeder_paths) and feeder_paths[i] and len(feeder_paths[i]) >= 2:
-            path_pts = [(p[0], p[1]) for p in feeder_paths[i]]
-        else:
-            # Fallback: прямая линия от ЦУ до ОРШ
-            ax, ay = network['anchor']['x'], network['anchor']['y']
-            path_pts = [(ax, ay), (zxy[0], zxy[1])]
-        draw_dashed(dr, path_pts, zcolor[i] + (215,),
-                     max(5, round(6 * k)), phase=i * (DASH + GAP) / 2.0)
+        ax, ay = network['anchor']['x'], network['anchor']['y']
+        # Пунктир — прямо от ЦУ до зонного ОРШ
+        draw_dashed(dr, [(ax, ay), (zxy[0], zxy[1])],
+                     zcolor[i] + (215,), max(5, round(6 * k)),
+                     phase=i * (DASH + GAP) / 2.0)
 
+    # Слой 5: муфты (бирюзовые квадраты)
     for c in network['couplers']:
         x, y = c['x'], c['y']
         s = 6 * k
-        dr.rectangle([x - s, y - s, x + s, y + s], fill=C_COUP, outline=C_COUP_OUT,
+        dr.rectangle([x - s, y - s, x + s, y + s],
+                      fill=C_COUP, outline=C_COUP_OUT,
                       width=max(1, round(2 * k)))
 
+    # Слой 6: ДХ (цветные квадраты)
     for d in network['drops']:
         if not d['poly']:
             continue
@@ -397,13 +504,16 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
         col = zcolor[zi]
         x, y = last
         s = 4 * k
-        dr.rectangle([x - s, y - s, x + s, y + s], fill=col + (255,), outline=C_HH_OUT,
+        dr.rectangle([x - s, y - s, x + s, y + s],
+                      fill=col + (255,), outline=C_HH_OUT,
                       width=max(1, round(k)))
 
+    # Слой 7: зонные ОРШ (шкафы) с подписями
     f_z1 = fnt(max(26, round(34 * k)))
     f_z2 = fnt(max(20, round(26 * k)), bold=False)
     labels = Labels()
 
+    # Зарезервируем места вокруг ОРШ и ЦУ
     for i in range(1, len(zones_layout)):
         zxy = zones_layout[i].get('px')
         if not zxy:
@@ -424,104 +534,154 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
         draw_orsh(dr, x, y, 16 * k, col, i)
         name = zname[i]
         dh = zones_layout[i].get('houses', 0)
-        tw = max(dr.textlength(name, font=f_z1), dr.textlength(f'{dh} ДХ', font=f_z2))
+        tw = max(dr.textlength(name, font=f_z1),
+                  dr.textlength(f'{dh} ДХ', font=f_z2))
         hgt = f_z1.size + f_z2.size + 2
         pos = labels.place(x, y, int(tw), hgt, W, H)
         if pos:
             bx, by = pos
-            dr.rectangle([bx - 8, by - 6, bx + tw + 8, by + hgt + 6], fill=(12, 14, 20, 130))
+            dr.rectangle([bx - 8, by - 6, bx + tw + 8, by + hgt + 6],
+                          fill=(12, 14, 20, 130))
             dr.text((bx, by), name, font=f_z1, fill=(255, 255, 255, 255),
-                     stroke_width=max(2, round(4 * k)), stroke_fill=(15, 15, 15, 255))
-            dr.text((bx, by + f_z1.size + 2), f'{dh} ДХ', font=f_z2, fill=(255, 235, 180, 255),
-                     stroke_width=max(2, round(3 * k)), stroke_fill=(15, 15, 15, 255))
+                     stroke_width=max(2, round(4 * k)),
+                     stroke_fill=(15, 15, 15, 255))
+            dr.text((bx, by + f_z1.size + 2), f'{dh} ДХ', font=f_z2,
+                     fill=(255, 235, 180, 255),
+                     stroke_width=max(2, round(3 * k)),
+                     stroke_fill=(15, 15, 15, 255))
 
+    # Слой 8: ЦУ (центральный узел)
     draw_olt_node(dr, ax, ay, 30 * k)
     f_cu = fnt(max(26, round(34 * k)))
     t1 = 'ЦУ · OLT — центральный узел села'
     zone_dh_cu = zones_layout[0].get('houses', 0) if zones_layout else 0
     t2 = f"корневая зона: {zone_dh_cu} ДХ"
-    pos = labels.place(ax, ay, int(dr.textlength(t1, font=f_cu)), f_cu.size + f_z2.size, W, H)
+    pos = labels.place(ax, ay, int(dr.textlength(t1, font=f_cu)),
+                        f_cu.size + f_z2.size, W, H)
     if pos:
         bx, by = pos
         tw1 = int(dr.textlength(t1, font=f_cu))
-        dr.rectangle([bx - 8, by - 6, bx + tw1 + 8, by + f_cu.size + f_z2.size + 6],
+        dr.rectangle([bx - 8, by - 6, bx + tw1 + 8,
+                       by + f_cu.size + f_z2.size + 6],
                       fill=(12, 14, 20, 130))
         dr.text((bx, by), t1, font=f_cu, fill=(255, 255, 255, 255),
-                 stroke_width=max(2, round(4 * k)), stroke_fill=(120, 0, 0, 255))
-        dr.text((bx, by + f_cu.size + 2), t2, font=f_z2, fill=(255, 235, 180, 255),
-                 stroke_width=max(2, round(3 * k)), stroke_fill=(120, 0, 0, 255))
+                 stroke_width=max(2, round(4 * k)),
+                 stroke_fill=(120, 0, 0, 255))
+        dr.text((bx, by + f_cu.size + 2), t2, font=f_z2,
+                 fill=(255, 235, 180, 255),
+                 stroke_width=max(2, round(3 * k)),
+                 stroke_fill=(120, 0, 0, 255))
 
     _notify("Слои сети отрисованы", 0.75)
 
+    # === 4. Шапка со статистикой ===
     canvas = Image.new('RGB', (W, H + HH_HDR), (10, 18, 30))
     map_rgb = base.convert('RGBA')
     map_rgb.alpha_composite(ov)
     canvas.paste(map_rgb.convert('RGB'), (0, HH_HDR))
     dh2 = ImageDraw.Draw(canvas)
+
     f1, f2, f3 = fnt(46), fnt(27, bold=False), fnt(27)
-    dh2.text((26, 12), f"с. {village.get('name', '?')} — схема D: зонные ОРШ (сплиттеры 1:64) "
+    dh2.text((26, 12),
+              f"с. {village.get('name', '?')} — схема D: зонные ОРШ (сплиттеры 1:64) "
               f"при едином узле OLT", font=f1, fill=(240, 245, 250))
-    dh2.text((26, 68), f"спутник Google z{geo.get('zoom', 18)} ({mpp:.2f} м/px) · "
-              f"топология сети, муфты и дропы — как в схеме A", font=f2, fill=(170, 185, 200))
-    st = (f"ДХ: {boq.get('dhx_served', 0)}   ·   зонных ОРШ: {boq.get('n_zones', 0)} + ЦУ   ·   "
-           f"волокно-км: {boq.get('fiber_km', 0):.1f}   ·   кабель-км: {boq.get('cable_km_raw', 0):.1f}   ·   "
-           f"дроп-км: {boq.get('drop_cable_km', 0):.1f}   ·   сплиттеры 1×64: {boq.get('splitters64', 0)}")
+    dh2.text((26, 68),
+              f"спутник Google z{geo.get('zoom', 18)} ({mpp:.2f} м/px) · "
+              f"топология сети, муфты и дропы — как в схеме A",
+              font=f2, fill=(170, 185, 200))
+    st = (f"ДХ: {boq.get('dhx_served', 0)}   ·   "
+           f"зонных ОРШ: {boq.get('n_zones', 0)} + ЦУ   ·   "
+           f"волокно-км: {boq.get('fiber_km', 0):.1f}   ·   "
+           f"кабель-км: {boq.get('cable_km_raw', 0):.1f}   ·   "
+           f"дроп-км: {boq.get('drop_cable_km', 0):.1f}   ·   "
+           f"сплиттеры 1×64: {boq.get('splitters64', 0)}")
     dh2.text((26, 106), st, font=f3, fill=(255, 220, 120))
 
-    rows = [('ЦУ', C_CU, f"корневая зона: {zones_layout[0].get('houses', 0)} ДХ · "
-                          f"{zones_layout[0].get('splitters', 0)}×1:64 · "
-                          f"кросс {zones_layout[0].get('orsh_ports', 0)} портов")] if zones_layout else []
+    # === 5. Легенда зон ===
+    rows = [('ЦУ', C_CU,
+              f"корневая зона: {zones_layout[0].get('houses', 0)} ДХ · "
+              f"{zones_layout[0].get('splitters', 0)}×1:64 · "
+              f"кросс {zones_layout[0].get('orsh_ports', 0)} портов")] \
+            if zones_layout else []
     for i in range(1, len(zones_layout)):
         z = zones_layout[i]
-        rows.append((zname[i], zcolor[i], f"{z.get('houses', 0)} ДХ · {z.get('splitters', 0)}×1:64 · "
-                                            f"фидер {z.get('feeder_fibers', 0)} вол. · "
-                                            f"{z.get('root_dist_m', 0) / 1000:.2f} км от ЦУ"))
+        rows.append((zname[i], zcolor[i],
+                      f"{z.get('houses', 0)} ДХ · {z.get('splitters', 0)}×1:64 · "
+                      f"фидер {z.get('feeder_fibers', 0)} вол. · "
+                      f"{z.get('root_dist_m', 0) / 1000:.2f} км от ЦУ"))
     if len(rows) <= 1:
-        rows.append(('--', (120, 120, 120), 'зонные ОРШ не образуются: село компактное, экономия ниже S_MIN'))
+        rows.append(('--', (120, 120, 120),
+                      'зонные ОРШ не образуются: село компактное, '
+                      'экономия ниже S_MIN'))
 
     fl_t, fl_r = fnt(32), fnt(28, bold=False)
     LW = 900
     LHH = 58 + len(rows) * 52 + 36 + 50 + 7 * 52 + 28
     lg = Image.new('RGBA', (LW, LHH), (8, 12, 20, 218))
     ld = ImageDraw.Draw(lg)
-    s_min_km = boq.get('s_min_km', 15.0)
-    ld.text((20, 14), f"ЗОНЫ ОРШ (схема D, S_MIN = {s_min_km:g})", font=fl_t, fill=(240, 240, 240))
+    s_min_km = boq.get('s_min_km', 15.0)  # берём из boq если есть
+    ld.text((20, 14),
+             f"ЗОНЫ ОРШ (схема D, S_MIN = {s_min_km:g})",
+             font=fl_t, fill=(240, 240, 240))
     yy = 58
     for name, col, txt in rows:
-        ld.rectangle([20, yy - 15, 52, yy + 15], fill=col, outline=(255, 255, 255), width=2)
-        ld.text((64, yy - 15), f'{name}: {txt}', font=fl_r, fill=(228, 232, 238))
+        ld.rectangle([20, yy - 15, 52, yy + 15], fill=col,
+                      outline=(255, 255, 255), width=2)
+        ld.text((64, yy - 15), f'{name}: {txt}', font=fl_r,
+                 fill=(228, 232, 238))
         yy += 52
     yy += 14
     ld.line([(20, yy), (LW - 20, yy)], fill=(90, 100, 115), width=2)
     yy += 18
-    ld.text((20, yy), 'УСЛОВНЫЕ ОБОЗНАЧЕНИЯ', font=fl_t, fill=(240, 240, 240))
+    ld.text((20, yy), 'УСЛОВНЫЕ ОБОЗНАЧЕНИЯ', font=fl_t,
+             fill=(240, 240, 240))
     yy += 50
+    # Ствол
     ld.line([(20, yy), (52, yy)], fill=C_TRUNK[:3], width=6)
-    ld.text((64, yy - 15), 'ствол сети: волокна зоны ЦУ + фидеры зон', font=fl_r, fill=(228, 232, 238))
+    ld.text((64, yy - 15), 'ствол сети: волокна зоны ЦУ + фидеры зон',
+             font=fl_r, fill=(228, 232, 238))
     yy += 52
+    # Распределительная сеть
     ld.line([(20, yy), (52, yy)], fill=PALETTE[0], width=6)
-    ld.text((64, yy - 15), 'распределительная сеть зоны (цвет зоны)', font=fl_r, fill=(228, 232, 238))
+    ld.text((64, yy - 15), 'распределительная сеть зоны (цвет зоны)',
+             font=fl_r, fill=(228, 232, 238))
     yy += 52
+    # Фидер (пунктир)
     draw_dashed(ld, [(20, yy), (52, yy)], PALETTE[1] + (235,), 7)
-    ld.text((64, yy - 15), 'фидер ЦУ → зонный ОРШ (ceil(1,25 × сплиттеры зоны))', font=fl_r, fill=(228, 232, 238))
+    ld.text((64, yy - 15), 'фидер ЦУ → зонный ОРШ (ceil(1,25 × сплиттеры зоны))',
+             font=fl_r, fill=(228, 232, 238))
     yy += 52
+    # Дроп
     ld.line([(20, yy), (52, yy)], fill=C_DROP[:3], width=4)
-    ld.text((64, yy - 15), 'дроп-кабель к домохозяйству', font=fl_r, fill=(228, 232, 238))
+    ld.text((64, yy - 15), 'дроп-кабель к домохозяйству', font=fl_r,
+             fill=(228, 232, 238))
     yy += 52
-    ld.rectangle([28, yy - 12, 44, yy + 12], fill=C_COUP[:3], outline=(0, 60, 60), width=2)
-    ld.text((64, yy - 15), 'муфта оптическая (ветвление)', font=fl_r, fill=(228, 232, 238))
+    # Муфта
+    ld.rectangle([28, yy - 12, 44, yy + 12], fill=C_COUP[:3],
+                  outline=(0, 60, 60), width=2)
+    ld.text((64, yy - 15), 'муфта оптическая (ветвление)', font=fl_r,
+             fill=(228, 232, 238))
     yy += 52
-    ld.rectangle([30, yy - 9, 42, yy + 9], fill=PALETTE[2], outline=(25, 25, 25))
-    ld.text((64, yy - 15), 'домохозяйство (цвет его зоны)', font=fl_r, fill=(228, 232, 238))
+    # ДХ
+    ld.rectangle([30, yy - 9, 42, yy + 9], fill=PALETTE[2],
+                  outline=(25, 25, 25))
+    ld.text((64, yy - 15), 'домохозяйство (цвет его зоны)', font=fl_r,
+             fill=(228, 232, 238))
     yy += 52
+    # ОРШ
     draw_orsh(ld, 36, yy, 14, PALETTE[3], 1)
-    ld.text((64, yy - 15), 'зонный ОРШ-N — уличный шкаф (номер зоны на шкафе)', font=fl_r, fill=(228, 232, 238))
+    ld.text((64, yy - 15), 'зонный ОРШ-N — уличный шкаф (номер зоны на шкафе)',
+             font=fl_r, fill=(228, 232, 238))
     yy += 52
+    # ЦУ
     draw_olt_node(ld, 36, yy, 14)
-    ld.text((64, yy - 15), 'ЦУ · OLT — центральный узел: станция OLT, вход магистрали',
+    ld.text((64, yy - 15),
+             'ЦУ · OLT — центральный узел: станция OLT, вход магистрали',
              font=fl_r, fill=(228, 232, 238))
 
-    hh_pts = [(d['poly'][-1][0], d['poly'][-1][1]) for d in network['drops'] if d['poly']]
+    # === 6. Авто-размещение легенды ===
+    hh_pts = [(d['poly'][-1][0], d['poly'][-1][1]) for d in network['drops']
+               if d['poly']]
     coup_pts = [(c['x'], c['y']) for c in network['couplers']]
     orsh_pts = [z['px'] for z in zones_layout[1:] if z.get('px')]
     positions = {
@@ -535,12 +695,14 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
     for pname, (px, py) in positions.items():
         if px < 0 or py < HH_HDR:
             continue
-        w = legend_weight((px, py, px + LW, py + LHH), hh_pts, coup_pts, orsh_pts, (ax, ay))
+        w = legend_weight((px, py, px + LW, py + LHH),
+                           hh_pts, coup_pts, orsh_pts, (ax, ay))
         if best_w is None or w < best_w:
             best_pos, best_w, best_name = (px, py), w, pname
     if best_pos:
         canvas.paste(lg, best_pos, lg)
 
+    # === 7. Масштабная линейка ===
     cand = [100, 200, 500, 1000, 2000]
     valid_cands = [m2 for m2 in cand if m2 / mpp <= 1400]
     if valid_cands:
@@ -549,51 +711,74 @@ def render_network_map(village, bbox, geo, households, network, boq, optical_bud
         x0 = W - int(sb_px) - 60
         y0 = HH_HDR + H - 46
         txt = f'{sb_m} м' if sb_m < 1000 else f'{sb_m // 1000} км'
-        dh2.line([(x0, y0), (x0 + sb_px, y0)], fill=(255, 255, 255), width=5)
+        dh2.line([(x0, y0), (x0 + sb_px, y0)], fill=(255, 255, 255),
+                  width=5)
         for xx in (x0, x0 + sb_px / 2, x0 + sb_px):
-            dh2.line([(xx, y0 - 9), (xx, y0 + 9)], fill=(255, 255, 255), width=4)
-        dh2.text((x0 + sb_px / 2 - 34, y0 - 44), txt, font=fnt(27), fill=(255, 255, 255))
+            dh2.line([(xx, y0 - 9), (xx, y0 + 9)], fill=(255, 255, 255),
+                      width=4)
+        dh2.text((x0 + sb_px / 2 - 34, y0 - 44), txt, font=fnt(27),
+                  fill=(255, 255, 255))
 
+    # === 8. Стрелка севера ===
     nx, ny = W - 70, HH_HDR + 64
-    dh2.polygon([(nx, ny - 34), (nx - 13, ny + 16), (nx, ny + 6), (nx + 13, ny + 16)],
-                 outline=(255, 255, 255), width=3)
+    dh2.polygon([(nx, ny - 34), (nx - 13, ny + 16), (nx, ny + 6),
+                  (nx + 13, ny + 16)], outline=(255, 255, 255), width=3)
     dh2.text((nx - 8, ny + 18), 'С', font=fnt(27), fill=(255, 255, 255))
 
+    # === 9. Сохранение ===
     _notify("Сохраняю карту...", 0.92)
     os.makedirs(output_dir, exist_ok=True)
-    fname = os.path.join(output_dir, f"{village.get('key', 'village')}_зоны_ОРШ.jpg")
+    fname = os.path.join(output_dir,
+                          f"{village.get('key', 'village')}_зоны_ОРШ.jpg")
     canvas.save(fname, quality=90, subsampling=0)
+
+    # Превью для UI
     prev = canvas.copy()
     prev.thumbnail((1800, 1800), Image.LANCZOS)
-    prev_path = os.path.join(output_dir, f"{village.get('key', 'village')}_preview.png")
+    prev_path = os.path.join(output_dir,
+                              f"{village.get('key', 'village')}_preview.png")
     prev.save(prev_path)
+
     sz = os.path.getsize(fname) / 1e6
     dt = time.time() - t0
     _notify(f"Карта сохранена: {fname} ({sz:.1f} МБ, {dt:.0f} сек)", 1.0)
-    logger.info("Карта: %s (%.1f МБ), превью: %s, [%d сек]", fname, sz, prev_path, dt)
+    logger.info("Карта: %s (%.1f МБ), превью: %s, [%d сек]",
+                 fname, sz, prev_path, dt)
 
+    # Очистка памяти
     del base, ov, map_rgb, canvas, prev
     try:
         import gc
         gc.collect()
     except Exception:
         pass
+
     return fname, prev_path
 
 
+# ----------------------------------------------------------------------------
+# CLI для тестирования
+# ----------------------------------------------------------------------------
 if __name__ == '__main__':
     import argparse
     import json
     import sys
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+    logging.basicConfig(level=logging.INFO,
+                         format='%(asctime)s [%(levelname)s] %(message)s')
+
     ap = argparse.ArgumentParser(description='FTTH карта сети')
-    ap.add_argument('--result', required=True, help='путь к *_result.json из gpon_planner')
+    ap.add_argument('--result', required=True,
+                    help='путь к *_result.json из gpon_planner')
     ap.add_argument('--work-dir', default='./gpon_work')
     ap.add_argument('--output-dir', default='./gpon_work/maps')
-    ap.add_argument('--no-tiles', action='store_true', help='не скачивать тайлы')
+    ap.add_argument('--no-tiles', action='store_true',
+                    help='не скачивать тайлы (только слои на белом фоне)')
     args = ap.parse_args()
+
     with open(args.result, encoding='utf-8') as f:
         result = json.load(f)
+
     cache_dir = os.path.join(args.work_dir, 'tiles')
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -601,10 +786,18 @@ if __name__ == '__main__':
         print(f"  [{frac * 100:5.1f}%] {msg}")
 
     jpg, prev = render_network_map(
-        village=result['village'], bbox=result['bbox'], geo=result['geo'],
-        households=result['households'], network=result['network'],
-        boq=result['boq'], optical_budget=result.get('optical_budget', {}),
-        work_dir=args.work_dir, output_dir=args.output_dir, cache_tiles_dir=cache_dir,
-        progress_cb=progress, download_tiles=not args.no_tiles)
+        village=result['village'],
+        bbox=result['bbox'],
+        geo=result['geo'],
+        households=result['households'],
+        network=result['network'],
+        boq=result['boq'],
+        optical_budget=result.get('optical_budget', {}),
+        work_dir=args.work_dir,
+        output_dir=args.output_dir,
+        cache_tiles_dir=cache_dir,
+        progress_cb=progress,
+        download_tiles=not args.no_tiles,
+    )
     print(f"\nКарта: {jpg}")
     print(f"Превью: {prev}")

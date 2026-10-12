@@ -7,7 +7,8 @@
 ### Сообщение об ошибке
 
 1. Проверьте, что баг ещё не описан в [Issues](../../issues)
-2. Создайте новый issue с заголовком вида: `[BUG] Краткое описание`
+2. Создайте новый issue с заголовком вида:
+   `[BUG] Краткое описание`
 3. В теле укажите:
    - Версия Python (`python --version`)
    - Версия ОС (Windows 10/11, macOS, Linux)
@@ -60,10 +61,10 @@ config.py          # Конфигурация SD-генератора
 # Синтаксис
 python -m py_compile *.py
 
-# Базовые тесты
+# Базовые тесты (без интернета)
 python -c "
 import sys; sys.path.insert(0, '.')
-from gpon_planner import decompose, ceilr
+from gpon_planner import GPONPlanner, VillageSpec, decompose, ceilr
 assert decompose(8, [8, 12, 16]) == [8]
 assert ceilr(770.0000001) == 770
 print('OK')

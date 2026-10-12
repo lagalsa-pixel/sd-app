@@ -1,12 +1,29 @@
 # ============================================================
 # SD Image Generator + GPON FTTH Planner — зависимости
 # ============================================================
+# Базовые
 torch>=2.1.0
 torchvision>=0.16.0
+
+# Stable Diffusion / transformers
 diffusers>=0.27.0
 transformers>=4.38.0
 accelerate>=0.25.0
+
+# Опционально — ускорение на GPU (устанавливается только при наличии CUDA)
+# xformers>=0.0.23
+
+# Изображения
 Pillow>=10.0.0
+
+# GPON FTTH Planner (для вкладки GPON)
+# — scipy с cKDTree, sparse.csgraph.dijkstra, ndimage для векторизации
 scipy>=1.10.0
 numpy>=1.24.0
+
+# HTTP-запросы (загрузка OSM-данных с api.openstreetmap.org)
 requests>=2.28.0
+
+# (Tkinter входит в стандартную поставку Python на Windows)
+# Если используете Python из python.org — tkinter уже внутри.
+# Для Ubuntu/Debian: sudo apt install python3-tk

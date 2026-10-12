@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "lagalsa-pixel" }
+    { name = "SD App Contributors" }
 ]
 keywords = [
     "stable-diffusion",
@@ -26,8 +26,8 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: GTK",
     "Environment :: Win32 (MS Windows)",
-    "Environment :: X11 Applications",
     "Environment :: MacOS X",
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: Telecommunications Industry",
@@ -46,6 +46,7 @@ classifiers = [
     "Topic :: Telecommunications",
 ]
 dependencies = [
+    # Базовые (GPON + UI)
     "Pillow>=10.0.0",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
@@ -53,6 +54,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Stable Diffusion (тяжёлые, опциональные)
 sd = [
     "torch>=2.1.0",
     "torchvision>=0.16.0",
@@ -60,11 +62,13 @@ sd = [
     "transformers>=4.38.0",
     "accelerate>=0.25.0",
 ]
+# Для разработки
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pyinstaller>=5.13",
 ]
+# Всё сразу
 all = [
     "torch>=2.1.0",
     "torchvision>=0.16.0",
@@ -75,8 +79,8 @@ all = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/lagalsa-pixel/sd-app"
-"Bug Tracker" = "https://github.com/lagalsa-pixel/sd-app/issues"
+"Homepage" = "https://github.com/your-username/sd-app"
+"Bug Tracker" = "https://github.com/your-username/sd-app/issues"
 "Algorithm Source" = "https://github.com/lagalsa-pixel/gpon-ftth-planner"
 
 [tool.setuptools]
