@@ -926,7 +926,79 @@ def anchor_candidates_vectorized(v_lat: float, v_lon: float,
 
 
 # ----------------------------------------------------------------------------
-# Детекция домохозяйств (упрощённая: только OSM-здания)
+# CV-детекция крыш (numpy + scipy, без OpenCV)
+# ----------------------------------------------------------------------------
+def detect_roofs_numpy(mos_rgb, mpp, P):
+    """CV-детекция крыш через HSV-маски цветов кровли + морфология.
+
+    Аналог detect_roofs() из оригинала, но без OpenCV:
+      - PIL для конвертации RGB->HSV;
+      - numpy для масок цветов;
+      - scipy.ndimage для морфологии и связных компонент.
+
+    Возвращает список (x, y, w, h) — кандидаты крыш в пикселях мозаики.
+    """
+    from scipy import ndimage
+    from PIL import Image as _Img
+
+    img = _Img.fromarray(mos_rgb)
+    hsv_img = img.convert('HSV')
+    hsv = np.array(hsv_img)
+    h = hsv[..., 0].astype(np.int32)
+    s = hsv[..., 1].astype(np.int32)
+    v = hsv[..., 2].astype(np.int32)
+
+    blue = (h >= 180) & (h <= 264) & (s > 65) & (v > 50)
+    red = ((h <= 24) | (h >= 336)) & (s > 75) & (v > 55)
+    orange = (h >= 26) & (h <= 70) & (s > 85) & (v > 95)
+    green = (h >= 80) & (h <= 170) & (s > 65) & (v > 50)
+    gray = (s < 50) & (v > 140) & (v < 248)
+    mask = blue | red | orange | green | gray
+    m = mask.astype(bool)
+
+    struct = np.ones((3, 3), dtype=bool)
+    m_closed = ndimage.binary_dilation(m, structure=struct)
+    m_closed = ndimage.binary_erosion(m_closed, structure=struct)
+    m_opened = ndimage.binary_erosion(m_closed, structure=struct)
+    m_opened = ndimage.binary_dilation(m_opened, structure=struct)
+
+    labeled, n_comp = ndimage.label(m_opened)
+    if n_comp == 0:
+        return []
+
+    min_area = P('hh_cv_min_area_px')
+    max_area = P('hh_cv_max_area_px')
+    min_side = P('hh_cv_min_side_px')
+    min_fill = P('hh_cv_min_fill')
+    max_aspect = P('hh_cv_max_aspect')
+
+    slices = ndimage.find_objects(labeled)
+    res = []
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        component_mask = (labeled[sl] == i)
+        area = int(component_mask.sum())
+        if area < min_area or area > max_area:
+            continue
+        y0, y1 = sl[0].start, sl[0].stop
+        x0, x1 = sl[1].start, sl[1].stop
+        w_ = x1 - x0
+        h_ = y1 - y0
+        if w_ < min_side or h_ < min_side:
+            continue
+        fill_ratio = area / (w_ * h_)
+        if fill_ratio < min_fill:
+            continue
+        aspect = max(w_, h_) / max(1, min(w_, h_))
+        if aspect > max_aspect:
+            continue
+        res.append((x0 + w_ / 2.0, y0 + h_ / 2.0, float(w_), float(h_)))
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Детекция домохозяйств (OSM + CV-супплект крыш)
 # ----------------------------------------------------------------------------
 def detect_households(buildings: List[dict], roads: List[dict],
                        v: dict, bbox: List[float],
