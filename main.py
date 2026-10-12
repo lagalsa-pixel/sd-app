@@ -24,6 +24,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, Optional
 
 from PIL import Image, ImageTk
+# Снимаем ограничение на размер изображения для крупных сёл
+Image.MAX_IMAGE_PIXELS = None
 
 import config
 from generator import SDGenerator, save_image
@@ -554,6 +556,19 @@ class GPONTab(ttk.Frame):
         ttk.Label(frame, textvariable=self.plan_status_var, foreground="blue",
                   font=("Segoe UI", 9)).pack(anchor="w", **pad)
         ttk.Separator(frame).pack(fill="x", **pad)
+        # Загрузка пользовательской карты (генплана)
+        user_map_frame = ttk.LabelFrame(frame, text="Карта пользователя (генплан)")
+        user_map_frame.pack(fill="x", **pad)
+        self.user_map_path: Optional[str] = None
+        self.user_map_var = tk.StringVar(value="Не загружена")
+        ttk.Label(user_map_frame, textvariable=self.user_map_var,
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=4)
+        uf = ttk.Frame(user_map_frame)
+        uf.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(uf, text="📋 Загрузить карту...",
+                   command=self._load_user_map).pack(side="left")
+        ttk.Button(uf, text="🗑 Убрать",
+                   command=self._clear_user_map).pack(side="left", padx=4)
         ttk.Button(frame, text="📂 Открыть папку GPON output", command=self._open_output_dir).pack(fill="x", **pad)
         ttk.Button(frame, text="💾 Сохранить отчёт (JSON)...", command=self._save_report).pack(fill="x", **pad)
         ttk.Separator(frame).pack(fill="x", **pad)
@@ -672,6 +687,31 @@ class GPONTab(ttk.Frame):
         self.boundary_var.set("Авто (по застройке OSM)")
         self.plan_status_var.set("Граница сброшена. Будет авто-определение.")
 
+    def _load_user_map(self):
+        """Загрузить пользовательскую карту (генплан)."""
+        path = filedialog.askopenfilename(
+            title="Выберите карту (генплан)",
+            filetypes=[
+                ("Изображения", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self.user_map_path = path
+        import os
+        filename = os.path.basename(path)
+        size_kb = os.path.getsize(path) / 1024
+        self.user_map_var.set(f"{filename} ({size_kb:.0f} КБ)")
+        self.plan_status_var.set(f"Карта загружена: {filename}. "
+                                 "При планировании сеть будет отрисована на ней.")
+
+    def _clear_user_map(self):
+        """Убрать пользовательскую карту."""
+        self.user_map_path = None
+        self.user_map_var.set("Не загружена")
+        self.plan_status_var.set("Карта пользователя убрана.")
+
     def _open_output_dir(self):
         import subprocess
         out_dir = config.APP_DIR / "gpon_work"
@@ -708,7 +748,8 @@ class GPONTab(ttk.Frame):
                     render_map=bool(self.render_map_var.get()),
                     use_cv=bool(self.use_cv_var.get()),
                     bbox_lock=self.bbox_lock,
-                    polygon_lock=self.polygon_lock)
+                    polygon_lock=self.polygon_lock,
+                    user_map_path=self.user_map_path)
         self._planning = True
         self.plan_button.config(state="disabled")
         self.plan_progress["value"] = 0
@@ -743,14 +784,50 @@ class GPONTab(ttk.Frame):
                                    polygon_lock=task.get('polygon_lock'))
 
             def progress_cb(msg, frac):
+                # Print to console (CMD window) for real-time monitoring
+                print(f"  [{frac * 100:5.1f}%] {msg}", flush=True)
+                # Log to file
+                logger.info("[GPON] %s (%.0f%%)", msg, frac * 100)
+                # Update GUI progress bar
                 self._put("progress", {"msg": msg, "frac": frac})
+                # Log key milestones to report panel
                 if any(kw in msg.lower() for kw in ['osm:', 'найдено', 'сеть:', 'boq:', 'бюджет', 'граница', 'цу:',
-                                                     'cv:', 'мозаика', 'космоснимку']):
+                                                     'cv:', 'мозаика', 'космоснимку', 'скачиваю',
+                                                     'граф', 'dijkstra', 'муфт', 'дроп',
+                                                     'карта сохранена', 'зон']):
                     self._put("log", msg)
 
             result = planner.run(village, progress_cb=progress_cb,
                                   render_map=task['render_map'],
                                   use_cv_detection=task['use_cv'])
+
+            # Если загружена пользовательская карта — отрисовать сеть на ней
+            if task.get('user_map_path'):
+                try:
+                    self._put("progress", {"msg": "Отрисовка на пользовательской карте...", "frac": 0.99})
+                    from user_map import load_user_image, georeference_by_bbox, render_on_user_map
+                    user_img = load_user_image(task['user_map_path'])
+                    # Простая геопривязка по bbox (предполагаем, что карта не повёрнута)
+                    bbox = result.get('bbox', [0, 0, 0, 0])
+                    transform = georeference_by_bbox(user_img.size[0], user_img.size[1],
+                                                      tuple(bbox))
+                    maps_dir = str(config.APP_DIR / "gpon_work" / "maps")
+                    import os
+                    os.makedirs(maps_dir, exist_ok=True)
+                    jpg, prev = render_on_user_map(
+                        user_img, transform, result.get('network', {}),
+                        result.get('boq', {}), result.get('households', []),
+                        result.get('village', {}), maps_dir,
+                        progress_cb=lambda m, f: self._put("progress", {"msg": m, "frac": 0.99 + 0.01 * f})
+                    )
+                    if jpg:
+                        result['user_map_path'] = jpg
+                        result['user_map_preview'] = prev
+                        self._put("log", f"Карта пользователя: {jpg}")
+                except Exception as e:
+                    logger.error("Не удалось отрисовать на пользовательской карте: %s", e)
+                    self._put("log", f"Ошибка карты пользователя: {e}")
+
             self._put("done", result)
         except Exception as e:
             logger.exception("Ошибка в потоке GPON")

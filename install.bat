@@ -1,148 +1,86 @@
 @echo off
 REM ============================================================
-REM SD APP - install dependencies (if Python already installed)
+REM SD Image Generator — Установка зависимостей
 REM ============================================================
-REM Requires: Python 3.10, 3.11, or 3.12 (NOT 3.13/3.14 - too new)
+REM Запускать двойным кликом.
+REM Требуется Python 3.10+ (должен быть в PATH).
 REM ============================================================
 
-REM Change to script directory (critical!)
-cd /d "%~dp0"
+chcp 65001 >nul
+setlocal EnableDelayedExpansion
 
 echo.
-echo ============================================================
-echo   SD App - Installing dependencies
-echo ============================================================
-echo.
-echo Current directory:
-cd
+echo === SD Image Generator — Установка ===
 echo.
 
-REM Step 1: Check Python
-echo Step 1: Check Python...
+REM Проверка Python
+where python >nul 2>nul
+if errorlevel 1 (
+    echo [ОШИБКА] Python не найден в PATH.
+    echo Установите Python 3.10+ с https://www.python.org/downloads/windows/
+    echo При установке ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH".
+    pause
+    exit /b 1
+)
+
+echo Найден Python:
 python --version
-if errorlevel 1 goto NO_PYTHON
-echo OK
 echo.
 
-REM Step 2: Check version - warn if 3.13+
-python -c "import sys; exit(0 if sys.version_info < (3,13) else 1)" 2>nul
-if errorlevel 1 (
-    echo [WARNING] Python 3.13+ detected.
-    echo Some packages (numpy, scipy) may not have wheels for 3.13/3.14.
-    echo If installation fails, install Python 3.12 from:
-    echo   https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe
-    echo.
+REM Спрашиваем GPU
+set /p gpu="Есть ли у вас GPU NVIDIA? (y/n) [n]: "
+if /i "%gpu%"=="y" (
+    set "TORCH_IDX=cu121"
+) else (
+    set "TORCH_IDX=cpu"
 )
 
-REM Step 3: Ask about GPU
-set /p GPU="Do you have NVIDIA GPU? (y/n) [n]: "
-if /i "%GPU%"=="y" set TORCH_IDX=cu121
-if /i "%GPU%"=="Y" set TORCH_IDX=cu121
-if not defined TORCH_IDX set TORCH_IDX=cpu
-
 echo.
-echo Selected install: %TORCH_IDX%
+echo Выбран вариант установки: %TORCH_IDX%
 echo.
 
-REM Step 4: Create venv if not exists
-echo Step 4: Create virtual environment...
-if exist ".venv\Scripts\activate.bat" goto ACTIVATE
-echo Running: python -m venv .venv
-python -m venv .venv
-if errorlevel 1 (
-    echo.
-    echo ERROR: Failed to create .venv
-    echo Possible reasons:
-    echo   - Python was just installed, need to restart CMD
-    echo   - Antivirus blocking
-    echo   - No write permission in this folder
-    echo.
-    echo Try: close this window, open new CMD, run again.
-    echo.
-    pause
-    exit /b 1
+REM Создаём виртуальное окружение
+if not exist ".venv" (
+    echo Создаю виртуальное окружение .venv ...
+    python -m venv .venv
+    if errorlevel 1 (
+        echo [ОШИБКА] Не удалось создать виртуальное окружение.
+        pause
+        exit /b 1
+    )
 )
-echo OK
-echo.
 
-:ACTIVATE
-echo Step 5: Activate virtual environment...
+REM Активируем
 call ".venv\Scripts\activate.bat"
-if errorlevel 1 (
-    echo ERROR: Failed to activate .venv
-    pause
-    exit /b 1
-)
-echo OK
-echo.
 
-REM Step 6: Upgrade pip
-echo Step 6: Upgrade pip...
+REM Обновляем pip
+echo.
+echo Обновляю pip...
 python -m pip install --upgrade pip
-echo.
 
-REM Step 7: Install PyTorch
-echo Step 7: Install PyTorch (%TORCH_IDX%)...
-echo This takes 5-15 minutes...
+REM Устанавливаем PyTorch
 echo.
+echo Устанавливаю PyTorch (%TORCH_IDX%)...
 if "%TORCH_IDX%"=="cu121" (
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ) else (
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 )
-if errorlevel 1 (
-    echo WARNING: PyTorch installation failed.
-    echo SD Image Generator won't work, but GPON FTTH Planner will.
-    echo Continuing...
-)
-echo.
 
-REM Step 8: Install other dependencies
-echo Step 8: Install other dependencies...
+REM Устанавливаем остальные зависимости
+echo.
+echo Устанавливаю остальные зависимости...
 pip install -r requirements.txt
-if errorlevel 1 (
-    echo ERROR: Failed to install dependencies.
-    pause
-    exit /b 1
-)
-echo OK
-echo.
 
-REM Step 9: Optional xformers for CUDA
+REM xformers (только для CUDA)
 if "%TORCH_IDX%"=="cu121" (
-    echo Step 9: Install xformers (optional)...
-    pip install xformers 2>nul
+    echo.
+    echo Устанавливаю xformers (опционально, ускоряет на NVIDIA)...
+    pip install xformers || echo [ПРЕДУПРЕЖДЕНИЕ] xformers не установился — это не критично, продолжаем.
 )
-echo.
 
-REM Step 10: Check tkinter
-echo Step 10: Check tkinter...
-python -c "import tkinter; print('tkinter OK, version:', tkinter.TkVersion)"
-if errorlevel 1 (
-    echo WARNING: tkinter not found! GUI won't work.
-    echo Reinstall Python 3.12 with "tcl/tk and IDLE" option.
-)
 echo.
-
-echo ============================================================
-echo   INSTALL COMPLETE!
-echo ============================================================
-echo.
-echo Now run run.bat to start the application.
+echo === Установка завершена! ===
+echo Теперь запустите run.bat для старта приложения.
 echo.
 pause
-exit /b 0
-
-:NO_PYTHON
-echo.
-echo ERROR: Python not found!
-echo.
-echo Please install Python 3.12 from:
-echo   https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe
-echo.
-echo IMPORTANT: Check "Add Python to PATH" during installation!
-echo.
-echo Or run install_no_python.bat for automatic installation.
-echo.
-pause
-exit /b 1

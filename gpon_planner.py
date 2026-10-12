@@ -1,16 +1,39 @@
 """
-gpon_planner.py — оптимизированная для CPU версия алгоритма проектирования
-FTTH (GPON) для сельских населённых пунктов.
+gpon_planner.py — оптимизированная для CPU версия алгоритма
+проектирования FTTH (GPON) для сельских населённых пунктов.
 
-Источник: github.com/lagalsa-pixel/gpon-ftth-planner (v1.1).
-Переписана с упором на:
-  - работу на CPU (без GPU, без VLM, без спутниковых тайлов);
+Источник алгоритма: репозиторий github.com/lagalsa-pixel/gpon-ftth-planner
+(см. ALGORITHM_FTTH.md v1.1). Реализация переписана с упором на:
+  - работу на CPU (без GPU, без VLM, без скачивания спутниковых тайлов);
   - векторизацию через NumPy/SciPy;
   - sparse CSR-матрицы для дорожного графа;
   - KDTree для O(log n) поиска ближайших узлов;
   - один вызов Dijkstra (вместо K вызовов) — для всех терминалов сразу;
   - кэширование построения дорожного графа.
+
+Алгоритм:
+  1. fetch     — загрузка OSM-данных (дороги + здания) или ввод вручную
+  2. households — детекция домохозяйств (OSM-здания + кластеризация)
+  3. anchor    — выбор здания-якоря ЦУ (скоринг)
+  4. network   — древовидная сеть: дорожный граф → MST → SPT → муфты → дропы
+  5. boq       — расчёт материалов: схема A (централизованная) и схема D
+                 (зонные ОРШ, жадное разбиение) + оптический бюджет
+
+Запуск как модуля:
+    from gpon_planner import GPONPlanner
+    planner = GPONPlanner()
+    planner.run(lat=50.1234, lon=82.5678, expected_hh=350)
+
+Ключевые отличия от оригинала:
+  - нет CV-детекции крыш (требует OpenCV + спутниковые снимки);
+  - нет VLM-верификации (требует внешнего API);
+  - нет SIFT-привязки пользовательского кадра;
+  - упрощённая детекция домохозяйств (только OSM-здания);
+  - все вычисления векторизованы (numpy/scipy).
+Это снижает точность для сёл с дефицитом OSM-разметки, но даёт
+сеть и BoQ, приемлемые для предварительной оценки и обучения.
 """
+
 from __future__ import annotations
 
 import logging
@@ -19,13 +42,20 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# Снимаем ограничение Pillow на размер изображения (DecompressionBombWarning)
+# Нужно для крупных сёл с мозаиками >178 Мп (14000×14000 px и больше)
+from PIL import Image as _PIL_Image
+_PIL_Image.MAX_IMAGE_PIXELS = None
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+# Константы алгоритма (см. ALGORITHM_FTTH.md приложение)
 M_PER_DEG_LAT = 111320.0
 OSM_API = 'https://api.openstreetmap.org/api/0.6/map'
 HDRS = {'User-Agent': 'FTTH-planner-cpu-optimized/1.0 (rural network design study)'}
@@ -38,72 +68,104 @@ MAIN_ROADS = {'primary', 'secondary', 'tertiary', 'trunk',
 BAD_BUILDINGS = ('garage', 'garages', 'barn', 'shed', 'greenhouse',
                  'roof', 'kiosk', 'hut')
 
+
+# ----------------------------------------------------------------------------
+# Параметры модели (значения по умолчанию, можно переопределить)
+# ----------------------------------------------------------------------------
 DEFAULT_PARAMS: Dict[str, Any] = dict(
-    boundary_grid_m=50.0, boundary_margin_m=300.0, boundary_close_m=100.0,
-    boundary_min_bld=15, boundary_keep_frac=0.65, probe_margin_m=900.0,
-    hh_eps_m=16.0, hh_road_max_m=60.0, hh_main_area_m2=36.0,
-    hh_cv_near_road_m=75.0, hh_cv_ctx_m=90.0, hh_cv_min_sep_m=15.0,
-    hh_cv_min_area_px=280, hh_cv_max_area_px=2400, hh_cv_min_side_px=10,
-    hh_cv_min_fill=0.5, hh_cv_max_aspect=4.0,
-    net_densify_m=4.0, net_snap_max_m=90.0, net_merge_m=50.0,
-    net_dedup_m=15.0, net_max_drop_m=120.0, net_intermediate_m=100.0,
-    ob_alpha_db_km=0.35, ob_splitter_il_db=21.0, ob_splice_db=0.10,
-    ob_connector_db=0.50, ob_penalty_db=0.20, ob_budget_db=28.0,
-    ob_budget_db_c=32.0, ob_margin_min_db=3.0,
-    fiber_reserve=1.25, min_fibers=8,
+    # --- детекция границы села ---
+    boundary_grid_m=50.0,
+    boundary_margin_m=300.0,
+    boundary_close_m=100.0,
+    boundary_min_bld=15,
+    boundary_keep_frac=0.65,
+    probe_margin_m=900.0,
+    # --- домохозяйства ---
+    hh_eps_m=16.0,             # кластеризация усадеб
+    hh_road_max_m=60.0,        # двор не дальше от дороги
+    hh_main_area_m2=36.0,      # мин. размер главного здания
+    # --- сеть ---
+    net_densify_m=4.0,         # шаг денсификации дорожного графа
+    net_snap_max_m=90.0,       # допуск привязки ДХ к дороге
+    net_merge_m=50.0,          # слияние точек в муфту
+    net_dedup_m=15.0,          # дедупликация муфт
+    net_max_drop_m=120.0,      # предел длины дропа
+    net_intermediate_m=100.0,  # шаг промежуточной муфты
+    # --- оптический бюджет (§VII ALGORITHM_FTTH.md v1.1) ---
+    ob_alpha_db_km=0.35,       # затухание G.652D @1310 нм (upstream — худший поток)
+    ob_splitter_il_db=21.0,    # PLC 1:64
+    ob_splice_db=0.10,         # сварка
+    ob_connector_db=0.50,     # SC/APC (3 шт: ODF ЦУ, кросс ОРШ, ONT)
+    ob_penalty_db=0.20,       # изгибы/наплывы
+    ob_budget_db=28.0,        # Class B+
+    ob_budget_db_c=32.0,      # Class C+ (для дальних зон)
+    ob_margin_min_db=3.0,     # эксплуатационный запас
+    # --- BoQ ---
+    fiber_reserve=1.25,
+    min_fibers=8,
     std_fibers=[8, 12, 16, 24, 32, 48, 64, 72, 96],
-    cable_stock=1.10, drop_stock=1.05, suspend_per_km=30,
-    drop_anchors_per_dh=2, drop_fix_per_dh=6, consum_stock=1.10,
-    split_ratio=64, orsh_ports_row=[144, 288, 576, 864, 1152],
+    cable_stock=1.10,
+    drop_stock=1.05,
+    suspend_per_km=30,
+    drop_anchors_per_dh=2,
+    drop_fix_per_dh=6,
+    consum_stock=1.10,
+    split_ratio=64,
+    orsh_ports_row=[144, 288, 576, 864, 1152],
     orsh_ports_row_zone=[48, 96, 144, 288, 576],
-    s_min_km=15.0, min_zone_dh=48,
+    # --- схема D (зонные ОРШ) ---
+    s_min_km=15.0,
+    min_zone_dh=48,
 )
 
 
-# ----------------------------- Утилиты -----------------------------
-def lon2tx(lon, z): return (lon + 180.0) / 360.0 * (1 << z)
+# ----------------------------------------------------------------------------
+# Утилиты
+# ----------------------------------------------------------------------------
+def lon2tx(lon: float, z: int) -> float:
+    return (lon + 180.0) / 360.0 * (1 << z)
 
 
-def lat2ty(lat, z):
+def lat2ty(lat: float, z: int) -> float:
     lr = math.radians(lat)
     return (1.0 - math.log(math.tan(lr) + 1.0 / math.cos(lr)) / math.pi) / 2.0 * (1 << z)
 
 
-def tx2lon(x, z): return x / (1 << z) * 360.0 - 180.0
-
-
-def ty2lat(y, z):
-    n = math.pi * (1.0 - 2.0 * y / (1 << z))
-    return math.degrees(math.atan(math.sinh(n)))
-
-
-def m_per_px(lat, z):
+def m_per_px(lat: float, z: int) -> float:
     return 156543.03392 * math.cos(math.radians(lat)) / (1 << z)
 
 
-def geo_to_px(lat, lon, west, north, mpp):
+def geo_to_px(lat: float, lon: float, west: float, north: float, mpp: float) -> Tuple[float, float]:
+    """Географические координаты → пиксели мозаики (или локальной СК)."""
     return ((lon - west) * (M_PER_DEG_LAT * math.cos(math.radians(lat))) / mpp,
             (north - lat) * M_PER_DEG_LAT / mpp)
 
 
-def px_to_geo(x, y, lat_ref, west, north, mpp):
+def px_to_geo(x: float, y: float, lat_ref: float, west: float, north: float, mpp: float) -> Tuple[float, float]:
     return (north - y * mpp / M_PER_DEG_LAT,
             west + x * mpp / (M_PER_DEG_LAT * math.cos(math.radians(lat_ref))))
 
 
-def nkey(p): return (round(p[0], 2), round(p[1], 2))
+def nkey(p) -> Tuple[float, float]:
+    """Ключ узла (округление до 0.01 px)."""
+    return (round(p[0], 2), round(p[1], 2))
 
 
-def ceilr(x): return math.ceil(round(x, 6))
+def ceilr(x: float) -> int:
+    """ceil без артефактов плавающей точки."""
+    return math.ceil(round(x, 6))
 
 
-def roundup01(x): return math.ceil(x * 10 - 1e-9) / 10
+def roundup01(x: float) -> float:
+    return math.ceil(x * 10 - 1e-9) / 10
 
 
-def decompose(F, std):
+def decompose(F: int, std: List[int]) -> List[int]:
+    """Число волокон → список параллельных кабелей стандартной ёмкости."""
     if F <= std[-1]:
         for s in std:
-            if s >= F: return [s]
+            if s >= F:
+                return [s]
     n96, rem = divmod(F, std[-1])
     out = [std[-1]] * n96
     if rem > 0:
@@ -114,19 +176,24 @@ def decompose(F, std):
     return out
 
 
-def meters_to_deg(m, lat):
+def meters_to_deg(m: float, lat: float) -> Tuple[float, float]:
     return m / M_PER_DEG_LAT, m / (M_PER_DEG_LAT * math.cos(math.radians(lat)))
 
 
-# ----------------------------- OSM -----------------------------
-def fetch_osm_bbox(lon_min, lat_min, lon_max, lat_max, cache_path=None):
+# ----------------------------------------------------------------------------
+# Загрузка OSM
+# ----------------------------------------------------------------------------
+def fetch_osm_bbox(lon_min: float, lat_min: float, lon_max: float, lat_max: float,
+                   cache_path: Optional[str] = None) -> Optional[bytes]:
+    """Скачать OSM-данные через api.openstreetmap.org. Кэш на диске."""
     if cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
         with open(cache_path, 'rb') as f:
             return f.read()
     try:
         import requests
     except ImportError as e:
-        raise RuntimeError("Библиотека requests не установлена.") from e
+        raise RuntimeError("Библиотека requests не установлена. Запустите install.bat") from e
+
     for attempt in range(4):
         try:
             r = requests.get(OSM_API, params={
@@ -140,13 +207,16 @@ def fetch_osm_bbox(lon_min, lat_min, lon_max, lat_max, cache_path=None):
             if r.status_code == 400:
                 logger.warning('bbox слишком велик для OSM API')
                 return None
+            logger.warning('HTTP %d, повтор...', r.status_code)
         except Exception as e:
             logger.warning('%s, повтор...', str(e)[:70])
         time.sleep(3 * (attempt + 1))
     return None
 
 
-def parse_osm(xml_bytes):
+def parse_osm(xml_bytes: bytes) -> Tuple[Dict[int, Tuple[float, float, dict]],
+                                         Dict[int, Tuple[List[int], dict]]]:
+    """Парсинг XML OSM. -> (nodes, ways)."""
     root = ET.fromstring(xml_bytes)
     nodes, ways = {}, {}
     for n in root.iter('node'):
@@ -159,7 +229,8 @@ def parse_osm(xml_bytes):
     return nodes, ways
 
 
-def osm_features(nodes, ways):
+def osm_features(nodes: Dict, ways: Dict) -> Tuple[List, List, List]:
+    """Извлечение дорог, зданий, POI из OSM."""
     roads, buildings, pois = [], [], []
     for wid, (nds, tags) in ways.items():
         hw = tags.get('highway')
@@ -173,6 +244,7 @@ def osm_features(nodes, ways):
             if len(pts) >= 4:
                 cx = sum(p[0] for p in pts) / len(pts)
                 cy = sum(p[1] for p in pts) / len(pts)
+                # Площадь по формуле шнурков (плоская аппроксимация)
                 a = 0.0
                 mx = M_PER_DEG_LAT * math.cos(math.radians(cy))
                 for k in range(len(pts)):
@@ -184,68 +256,722 @@ def osm_features(nodes, ways):
                 buildings.append(dict(
                     id=wid, poly=pts, center=[cx, cy], area=round(abs(a) / 2, 1),
                     tags={k: tags[k] for k in ('building', 'name', 'amenity', 'shop',
-                                               'office', 'height', 'building:levels') if k in tags}))
+                                               'office', 'height', 'building:levels')
+                          if k in tags}))
         if (tags.get('amenity') or tags.get('office') or tags.get('shop')) and not bld:
             if nds and nds[0] in nodes:
                 la, lo, _ = nodes[nds[0]]
                 pois.append(dict(id=wid, lat=la, lon=lo,
-                                 tags={k: tags[k] for k in ('amenity', 'office', 'shop', 'name') if k in tags}))
+                                 tags={k: tags[k] for k in ('amenity', 'office', 'shop', 'name')
+                                       if k in tags}))
     return roads, buildings, pois
 
 
-# ----------------------------- CV-детекция крыш (numpy + scipy, без OpenCV) ---
-def detect_roofs_numpy(mos_rgb: np.ndarray, mpp: float,
-                        P: Callable) -> List[Tuple[float, float, float, float]]:
+# ----------------------------------------------------------------------------
+# ОПТИМИЗАЦИЯ: векторизованная детекция границы села
+# ----------------------------------------------------------------------------
+def detect_bbox_vectorized(v_lat: float, v_lon: float, buildings: List[dict],
+                            probe: Tuple[float, float, float, float],
+                            P: Callable) -> List[float]:
+    """
+    Векторизованная версия detect_bbox из оригинала.
+    Использует numpy для операций с сеткой и scipy.ndimage для дилатации.
+
+    Возвращает bbox [lon_min, lat_min, lon_max, lat_max].
+    """
+    if not buildings:
+        return list(probe)
+
+    grid_m = P('boundary_grid_m')
+    margin = P('boundary_margin_m')
+    close_cells = max(1, int(round(P('boundary_close_m') / grid_m)))
+    min_bld = P('boundary_min_bld')
+    keep_frac = P('boundary_keep_frac')
+
+    # Векторизованный сбор центров зданий
+    centers = np.array([b['center'] for b in buildings], dtype=np.float64)
+    lats = centers[:, 0]
+    lons = centers[:, 1]
+    lat_min_arr, lon_min_arr = lats.min(), lons.min()
+    dlat = grid_m / M_PER_DEG_LAT
+    dlon = grid_m / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
+
+    # Индексы ячеек для каждого здания (векторизованно)
+    row = np.floor((lats - lat_min_arr) / dlat).astype(np.int32)
+    col = np.floor((lons - lon_min_arr) / dlon).astype(np.int32)
+    # Гистограмма — сколько зданий в каждой ячейке
+    rc_max = row.max() + 1 if len(row) else 1
+    cc_max = col.max() + 1 if len(col) else 1
+    grid = np.zeros((rc_max, cc_max), dtype=np.int32)
+    np.add.at(grid, (row, col), 1)
+
+    # Дилатация через scipy.ndimage (быстро, в C)
+    try:
+        from scipy import ndimage
+        r = close_cells
+        # Круглое ядро
+        yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+        kernel = (xx * xx + yy * yy <= r * r + 1).astype(np.uint8)
+        dil = ndimage.binary_dilation(grid > 0, structure=kernel)
+    except ImportError:
+        # Fallback на чистый numpy (медленнее)
+        dil = grid > 0
+        for _ in range(close_cells):
+            dil = dil | np.roll(dil, 1, 0) | np.roll(dil, -1, 0) | \
+                  np.roll(dil, 1, 1) | np.roll(dil, -1, 1)
+
+    # Связные компоненты
+    try:
+        from scipy import ndimage
+        labeled, n_comp = ndimage.label(dil)
+    except ImportError:
+        n_comp = 0
+        labeled = dil.astype(np.int32)
+
+    if n_comp == 0:
+        return list(probe)
+
+    # Для каждой компоненты — подсчёт зданий и центроид
+    # Векторизованно через ndimage.sum и ndimage.center_of_mass
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0  # фон не считаем
+
+    # Центроиды компонент (в индексах ячеек)
+    coms = ndimage.center_of_mass(np.ones_like(labeled), labeled,
+                                   range(1, n_comp + 1)) if n_comp > 0 else []
+
+    # Фильтр: >= min_bld зданий И центроид в пределах keep_frac зонда
+    probe_half_w = (probe[2] - probe[0]) * M_PER_DEG_LAT * math.cos(math.radians(v_lat)) / 2
+    probe_half_h = (probe[3] - probe[1]) * M_PER_DEG_LAT / 2
+    r_max = keep_frac * math.hypot(probe_half_w, probe_half_h)
+
+    kept_cells = []
+    for i, com in enumerate(coms, start=1):
+        if sizes[i] < min_bld:
+            continue
+        # Центроид в географических координатах
+        cla = lat_min_arr + (com[0] + 0.5) * dlat
+        clo = lon_min_arr + (com[1] + 0.5) * dlon
+        distm = math.hypot((cla - v_lat) * M_PER_DEG_LAT,
+                           (clo - v_lon) * M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
+        if distm <= r_max:
+            kept_cells.append((i, com))
+
+    if not kept_cells:
+        # Берём самую большую компоненту
+        biggest = sizes.argmax()
+        com = coms[biggest - 1]
+        kept_cells = [(biggest, com)]
+
+    # Собираем маску из оставшихся компонент
+    mask = np.zeros_like(labeled, dtype=bool)
+    for i, _ in kept_cells:
+        mask |= (labeled == i)
+
+    # Границы маски в индексах
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return list(probe)
+
+    rmin, rmax = int(rows[0]), int(rows[-1])
+    cmin, cmax = int(cols[0]), int(cols[-1])
+
+    lat_min = lat_min_arr + rmin * dlat - margin / M_PER_DEG_LAT
+    lat_max = lat_min_arr + (rmax + 1) * dlat + margin / M_PER_DEG_LAT
+    lon_min = lon_min_arr + cmin * dlon - margin / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
+    lon_max = lon_min_arr + (cmax + 1) * dlon + margin / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
+
+    # Клип по зонду
+    return [max(lon_min, probe[0]), max(lat_min, probe[1]),
+            min(lon_max, probe[2]), min(lat_max, probe[3])]
+
+
+# ----------------------------------------------------------------------------
+# ОПТИМИЗАЦИЯ: дорожный граф с KDTree и CSR-матрицей
+# ----------------------------------------------------------------------------
+class RoadGraphBuilder:
+    """Строит дорожный граф: узлы + рёбра + KDTree + CSR-матрица расстояний.
+
+    Оптимизация для CPU:
+      - узлы в numpy-массиве (np.float32 для экономии памяти);
+      - KDTree через scipy.spatial.cKDTree — O(log n) поиск ближайших;
+      - CSR-матрица через scipy.sparse — быстрая Dijkstra.
+    """
+
+    def __init__(self, mpp: float, densify_m: float):
+        self.mpp = mpp
+        self.densify_m = densify_m
+        self.pts: List[Tuple[float, float]] = []
+        self.idx: Dict[Tuple[float, float], int] = {}
+        self.edges: List[Tuple[int, int, float]] = []
+
+    def add_node(self, x: float, y: float) -> int:
+        k = (round(x, 1), round(y, 1))
+        i = self.idx.get(k)
+        if i is None:
+            i = len(self.pts)
+            self.pts.append((x, y))
+            self.idx[k] = i
+        return i
+
+    def add_polyline(self, pts_px: List[Tuple[float, float]]) -> None:
+        prev = None
+        for p in pts_px:
+            cur = self.add_node(p[0], p[1])
+            if prev is not None and cur != prev:
+                d = math.hypot(self.pts[cur][0] - self.pts[prev][0],
+                               self.pts[cur][1] - self.pts[prev][1]) * self.mpp
+                if d > 0.05:
+                    self.edges.append((prev, cur, d))
+            prev = cur
+
+    def build(self, roads: List[dict], west: float, north: float,
+              bounds: Optional[Tuple[float, float, float, float]] = None
+              ) -> Dict[str, Any]:
+        """Построить граф: densify дорог → узлы → CSR + KDTree."""
+        from scipy.spatial import cKDTree
+        from scipy.sparse import csr_matrix
+
+        mstep = self.densify_m
+        for r in roads:
+            pts = [geo_to_px(la, lo, west, north, self.mpp) for la, lo in r['pts']]
+            # Денсификация: вставить промежуточные точки с шагом mstep
+            dens = [pts[0]] if pts else []
+            for p in pts[1:]:
+                q = dens[-1]
+                seg = math.hypot(p[0] - q[0], p[1] - q[1]) * self.mpp
+                n_sub = int(seg / mstep)
+                for k in range(1, n_sub + 1):
+                    dens.append((q[0] + (p[0] - q[0]) * k / max(n_sub, 1),
+                                 q[1] + (p[1] - q[1]) * k / max(n_sub, 1)))
+                if seg < mstep:
+                    dens.append(p)
+            self.add_polyline(dens)
+
+        # Узлы в numpy-массиве (float32 для экономии памяти на больших графах)
+        Pt = np.array(self.pts, dtype=np.float32) if self.pts else np.zeros((0, 2), dtype=np.float32)
+        n = len(Pt)
+
+        # Маска bounds
+        allowed = np.ones(n, dtype=bool)
+        if bounds is not None and n > 0:
+            bx0, by0, bx1, by1 = bounds
+            allowed = ((Pt[:, 0] >= bx0) & (Pt[:, 0] <= bx1) &
+                       (Pt[:, 1] >= by0) & (Pt[:, 1] <= by1))
+
+        # CSR-матрица расстояний
+        rows, cols, vals = [], [], []
+        for (u, w, l) in self.edges:
+            if not (allowed[u] and allowed[w]):
+                continue
+            rows += [u, w]
+            cols += [w, u]
+            vals += [l, l]
+        C = csr_matrix((vals, (rows, cols)), shape=(n, n), dtype=np.float32)
+
+        return dict(P=Pt, kdt=cKDTree(Pt) if n > 0 else None,
+                    C=C, allowed=allowed)
+
+
+# ----------------------------------------------------------------------------
+# ОПТИМИЗАЦИЯ: ядро построения сети — один вызов Dijkstra для всех терминалов
+# ----------------------------------------------------------------------------
+def build_network_optimized(osm_data: dict, hhs: List[dict], anchor: dict,
+                             geo: dict, P: Callable,
+                             bounds: Optional[Tuple] = None,
+                             progress_cb: Optional[Callable[[str, float], None]] = None
+                             ) -> dict:
+    """
+    Оптимизированная версия build_network.
+
+    Ключевые оптимизации:
+      - один вызов scipy.sparse.csgraph.dijkstra для всех терминалов сразу
+        (в оригинале — K вызовов по отдельности, что в K раз медленнее);
+      - numpy-массивы для расстояний вместо Python-списков;
+      - float32 для экономии памяти;
+      - множества и словари для O(1) операций.
+
+    Возвращает dict в формате network.json (как в оригинале).
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    mpp = geo['mpp']
+    west, north = geo['west'], geo['north']
+    W, H = geo.get('W', 0), geo.get('H', 0)
+    MERGE_M, DEDUP_M = P('net_merge_m'), P('net_dedup_m')
+    MAX_DROP_M = P('net_max_drop_m')
+    INTERM = P('net_intermediate_m')
+
+    ax, ay = anchor['x'], anchor['y']
+
+    def _notify(msg: str, frac: float = 0.0):
+        if progress_cb:
+            try:
+                progress_cb(msg, frac)
+            except Exception:
+                pass
+
+    _notify("Строю дорожный граф...", 0.05)
+    builder = RoadGraphBuilder(mpp, P('net_densify_m'))
+    graph = builder.build(osm_data['roads'], west, north, bounds)
+    Pt, tree, C, allowed = graph['P'], graph['kdt'], graph['C'], graph['allowed']
+    n = len(Pt)
+    logger.info("Граф: %d узлов, %d рёбер", n, C.nnz // 2)
+
+    _notify(f"Граф готов: {n} узлов. Привязка ДХ...", 0.15)
+    # Привязка ЦУ
+    root_id = int(tree.query([ax, ay])[1]) if tree is not None else 0
+    # Привязка ДХ
+    hh_nodes: List[Optional[int]] = []
+    snap_d: List[float] = []
+    if tree is not None:
+        for h in hhs:
+            d, i = tree.query([h['cx'], h['cy']])
+            if d * mpp > P('net_snap_max_m') or not allowed[i]:
+                hh_nodes.append(None)
+            else:
+                hh_nodes.append(int(i))
+            snap_d.append(float(d * mpp))
+    else:
+        hh_nodes = [None] * len(hhs)
+        snap_d = [0.0] * len(hhs)
+
+    # Статистика
+    snap_arr = np.array(snap_d, dtype=np.float32)
+    sd = np.sort(snap_arr[snap_arr > 0])
+    if len(sd) > 0:
+        logger.info("Привязка ДХ: медиана %.0f м, p90 %.0f м, макс %.0f м;"
+                    " вне допуска: %d",
+                    float(sd[len(sd) // 2]),
+                    float(sd[9 * len(sd) // 10]),
+                    float(sd[-1]),
+                    sum(x is None for x in hh_nodes))
+
+    ok = [i for i in range(len(hhs)) if hh_nodes[i] is not None]
+    terminals = list(dict.fromkeys([root_id] + [hh_nodes[i] for i in ok]))
+    tpos = {t: i for i, t in enumerate(terminals)}
+
+    _notify("Считаю кратчайшие пути (Dijkstra)...", 0.25)
+    # ОПТИМИЗАЦИЯ: один вызов dijkstra для всех терминалов сразу
+    # Это даёт ускорение в K раз по сравнению с отдельными вызовами
+    Dm, pred_m = dijkstra(C, indices=terminals, return_predecessors=True,
+                          directed=False)
+
+    # MST по метрике кратчайших путей
+    K = len(terminals)
+    Dt = np.array([[Dm[i][t] for t in terminals] for i in range(K)],
+                   dtype=np.float32)
+    in_tree = [False] * K
+    best_w = [np.inf] * K
+    parent = [-1] * K
+    best_w[0] = 0.0
+    mst_pairs: List[Tuple[int, int]] = []
+    for _ in range(K):
+        b, bw = -1, np.inf
+        for i in range(K):
+            if not in_tree[i] and best_w[i] < bw:
+                b, bw = i, best_w[i]
+        if b < 0:
+            break
+        in_tree[b] = True
+        if parent[b] >= 0:
+            mst_pairs.append((terminals[parent[b]], terminals[b]))
+        for j in range(K):
+            if not in_tree[j] and Dt[b][j] < best_w[j]:
+                best_w[j] = float(Dt[b][j])
+                parent[j] = b
+
+    _notify("Строю SPT-дерево от корня...", 0.45)
+    # Объединение путей MST
+    union = set()
+    for (u, w) in mst_pairs:
+        iu = tpos[u]
+        cur = w
+        while cur != u and cur >= 0:
+            p = int(pred_m[iu][cur])
+            if p < 0:
+                break
+            union.add((min(p, cur), max(p, cur)))
+            cur = p
+
+    # CSR-матрица объединённого подграфа
+    ur, uc, uv = [], [], []
+    elen: Dict[Tuple[int, int], float] = {}
+    Pt64 = Pt.astype(np.float64) if Pt.dtype != np.float64 else Pt
+    for (u, w) in union:
+        l = float(math.hypot(Pt64[u][0] - Pt64[w][0],
+                             Pt64[u][1] - Pt64[w][1]) * mpp)
+        elen[(u, w)] = l
+        ur += [u, w]
+        uc += [w, u]
+        uv += [l, l]
+    U = csr_matrix((uv, (ur, uc)), shape=(n, n), dtype=np.float64)
+
+    _notify("Считаю SPT от корня...", 0.55)
+    DU, predU = dijkstra(U, indices=root_id, return_predecessors=True,
+                          directed=False)
+    predU = predU.astype(np.int64)
+
+    def path_to_root(node: int) -> Optional[List[int]]:
+        pth = [node]
+        cur = node
+        guard = 0
+        while cur != root_id:
+            p = int(predU[cur])
+            if p < 0:
+                return None
+            pth.append(p)
+            cur = p
+            guard += 1
+            if guard > n:
+                return None
+        return pth
+
+    hh_paths = {i: path_to_root(hh_nodes[i]) for i in ok}
+
+    # Муфты
+    couplers: Dict[int, List[int]] = {}
+
+    def add_coup(node: int, hi: int) -> None:
+        couplers.setdefault(node, []).append(hi)
+
+    # Слияние точек подключения в радиусе MERGE_M
+    order = sorted([i for i in ok if hh_paths[i] is not None],
+                   key=lambda i: float(DU[hh_nodes[i]]))
+    for hi in order:
+        pth = hh_paths[hi]
+        acc = 0.0
+        serve = None
+        for i in range(len(pth) - 1):
+            if pth[i] in couplers:
+                serve = pth[i]
+                break
+            acc += elen.get((min(pth[i], pth[i + 1]),
+                             max(pth[i], pth[i + 1])), 0.0)
+            if acc > MERGE_M:
+                break
+        add_coup(serve if serve is not None else pth[0], hi)
+
+    # Все узлы ветвления (степень >= 3) — тоже муфты
+    tree_edges = set()
+    for hi in order:
+        pth = hh_paths[hi]
+        for i in range(len(pth) - 1):
+            tree_edges.add((min(pth[i], pth[i + 1]),
+                            max(pth[i], pth[i + 1])))
+    deg: Dict[int, int] = {}
+    for (u, w) in tree_edges:
+        deg[u] = deg.get(u, 0) + 1
+        deg[w] = deg.get(w, 0) + 1
+    for node, dg in deg.items():
+        if dg >= 3:
+            couplers.setdefault(node, [])
+
+    _notify(f"Дедупликация муфт ({len(couplers)} шт.)...", 0.65)
+    # Дедупликация муфт ближе DEDUP_M по дереву
+    # ОРИГИНАЛ: O(n²) × O(n) path_dist_nodes в цикле while changed → O(n³)
+    # ОПТИМИЗАЦИЯ: один проход по дереву — для каждой муфты проверяем
+    # только её соседей на пути к корню (в пределах DEDUP_M), а не все пары
+
+    def path_dist_nodes(a: int, b: int) -> float:
+        if a == b:
+            return 0.0
+        pa = path_to_root(a)
+        if pa is None or b not in pa:
+            return 1e9
+        ib = pa.index(b)
+        return sum(elen.get((min(pa[i], pa[i + 1]),
+                              max(pa[i], pa[i + 1])), 0.0)
+                   for i in range(ib))
+
+    # ОПТИМИЗИРОВАННАЯ дедупликация: для каждой муфты ищем только
+    # ближайшую муфту на пути к корню (в пределах DEDUP_M), а не
+    # сравниваем все пары. Это O(n × path_length) вместо O(n² × path_length)
+    changed = True
+    _dedup_iter = 0
+    while changed and _dedup_iter < 5:  # лимит итераций для безопасности
+        changed = False
+        _dedup_iter += 1
+        # Сортируем по расстоянию от корня (ближайшие к корню — первыми)
+        nodes_c = sorted(couplers.keys(), key=lambda c: float(DU[c]))
+        for a in nodes_c:
+            if a not in couplers:
+                continue
+            # Идём от муфты 'a' к корню и ищем ближайшую другую муфту
+            pth = path_to_root(a)
+            if pth is None:
+                continue
+            acc = 0.0
+            for i in range(len(pth) - 1):
+                acc += elen.get((min(pth[i], pth[i + 1]),
+                                max(pth[i], pth[i + 1])), 0.0)
+                if acc > DEDUP_M:
+                    break
+                # Проверяем, есть ли здесь другая муфта
+                candidate = pth[i + 1]
+                if candidate in couplers and candidate != a:
+                    # Нашли близкую муфту — сливаем
+                    couplers[candidate].extend(couplers.pop(a))
+                    changed = True
+                    break
+            if changed:
+                break
+
+    _notify(f"Дедупликация завершена: {len(couplers)} муфт (итераций: {_dedup_iter})", 0.70)
+
+    def serving(hi: int) -> int:
+        pth = hh_paths[hi]
+        for i in range(len(pth)):
+            if pth[i] in couplers:
+                return pth[i]
+        return root_id
+
+    def drop_len(hi: int, sc: int) -> float:
+        pth = hh_paths[hi]
+        si = pth.index(sc)
+        return sum(elen.get((min(pth[i], pth[i + 1]),
+                              max(pth[i], pth[i + 1])), 0.0)
+                   for i in range(si))
+
+    _notify("Размещение промежуточных муфт...", 0.75)
+    # Промежуточные муфты через INTERM при дропе > MAX_DROP_M
+    for hi in order:
+        pth = hh_paths[hi]
+        hh = hhs[hi]
+        a_h = pth[0]
+        yard = float(math.hypot(hh['cx'] - Pt64[a_h][0],
+                                  hh['cy'] - Pt64[a_h][1]) * mpp)
+        sc = serving(hi)
+        dl = drop_len(hi, sc) + yard
+        while dl > MAX_DROP_M:
+            acc = 0.0
+            placed = None
+            for i in range(len(pth) - 1):
+                acc += elen.get((min(pth[i], pth[i + 1]),
+                                  max(pth[i], pth[i + 1])), 0.0)
+                if acc >= INTERM:
+                    placed = pth[i + 1]
+                    break
+            if placed is None or placed in couplers or placed == sc:
+                break
+            couplers.setdefault(placed, [])
+            sc = serving(hi)
+            dl2 = drop_len(hi, sc)
+            if dl2 >= dl:
+                break
+            dl = dl2 + yard
+
+    _notify("Считаю дропы...", 0.85)
+    # Дропы
+    import hashlib
+    drops = []
+    for hi in range(len(hhs)):
+        if hh_nodes[hi] is None or hh_paths.get(hi) is None:
+            continue
+        pth = hh_paths[hi]
+        sc = serving(hi)
+        si = pth.index(sc)
+        poly = [list(Pt64[pth[i]]) for i in range(si, -1, -1)]
+        a_h = pth[0]
+        # Дворовая прокладка (как в оригинале)
+        hx, hy = hhs[hi]['cx'], hhs[hi]['cy']
+        sx, sy = float(Pt64[a_h][0]), float(Pt64[a_h][1])
+        dx, dy = hx - sx, hy - sy
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            entry = [[sx, sy], [hx, hy]]
+        else:
+            hsh = int(hashlib.md5(str(hhs[hi].get('id', hi)).encode()).hexdigest()[:6], 16) / 0xFFFFFF
+            f_along = 0.30 + 0.35 * hsh
+            side = 1 if hsh > 0.5 else -1
+            ux, uy = dx / dist, dy / dist
+            px_, py_ = -uy, ux
+            if dist * mpp < 10:
+                m1 = [sx + dx * 0.55 + px_ * 2.5 * side, sy + dy * 0.55 + py_ * 2.5 * side]
+                entry = [[sx, sy], m1, [hx, hy]]
+            else:
+                a1 = [sx + px_ * dist * f_along * 0.55 + ux * dist * 0.22,
+                      sy + py_ * dist * f_along * 0.55 + uy * dist * 0.22]
+                a2 = [a1[0] + ux * dist * 0.5 + px_ * dist * 0.12 * side,
+                      a1[1] + uy * dist * 0.5 + py_ * dist * 0.12 * side]
+                entry = [[sx, sy], a1, a2, [hx, hy]]
+        poly += entry
+        dl = (sum(elen.get((min(pth[i], pth[i + 1]),
+                             max(pth[i], pth[i + 1])), 0.0)
+                  for i in range(si))
+              + sum(math.hypot(entry[k + 1][0] - entry[k][0],
+                                entry[k + 1][1] - entry[k][1])
+                    for k in range(len(entry) - 1)) * mpp)
+        drops.append(dict(hh=hi, coupler=sc, poly=poly, length_m=round(dl, 1)))
+
+    # Магистраль = объединение путей муфта → корень
+    feeder_edges = set()
+    for c in couplers:
+        pth = path_to_root(c)
+        if pth is None:
+            continue
+        for i in range(len(pth) - 1):
+            feeder_edges.add((min(pth[i], pth[i + 1]),
+                              max(pth[i], pth[i + 1])))
+    feeder_m = sum(elen.get(e, float(math.hypot(Pt64[e[0]][0] - Pt64[e[1]][0],
+                                                  Pt64[e[0]][1] - Pt64[e[1]][1]) * mpp))
+                   for e in feeder_edges)
+    drop_m = sum(dd['length_m'] for dd in drops)
+    coup_list = sorted([c for c in couplers if c != root_id])
+    stats = dict(households=len(hhs), served=len(drops),
+                 couplers=len(coup_list),
+                 feeder_km=round(feeder_m / 1000, 2),
+                 drop_km=round(drop_m / 1000, 2),
+                 avg_drop_m=round(drop_m / max(1, len(drops)), 1),
+                 max_drop_m=round(max((dd['length_m'] for dd in drops), default=0), 1))
+
+    _notify("Сеть построена.", 1.0)
+    logger.info("ОРШ id=%s; обслужено %d/%d ДХ; муфт %d; магистраль %.2f км; "
+                "дропы %.2f км, ср %.0f м, макс %.0f м",
+                anchor.get('id'), stats['served'], len(hhs),
+                stats['couplers'], stats['feeder_km'],
+                stats['drop_km'], stats['avg_drop_m'], stats['max_drop_m'])
+
+    return dict(anchor=dict(x=ax, y=ay, lat=anchor['lat'], lon=anchor['lon'],
+                             bld_id=anchor.get('id'), area=anchor.get('area')),
+                root_node=root_id,
+                couplers=[dict(node=int(c), x=float(Pt64[c][0]), y=float(Pt64[c][1]),
+                                label=f'М{i + 1}') for i, c in enumerate(coup_list)],
+                feeder_edges=[[[float(Pt64[e[0]][0]), float(Pt64[e[0]][1])],
+                                [float(Pt64[e[1]][0]), float(Pt64[e[1]][1])]]
+                               for e in sorted(feeder_edges)],
+                drops=drops, stats=stats)
+
+
+# ----------------------------------------------------------------------------
+# ОПТИМИЗАЦИЯ: выбор ЦУ через скоринг (векторизованный)
+# ----------------------------------------------------------------------------
+def anchor_candidates_vectorized(v_lat: float, v_lon: float,
+                                  buildings: List[dict], roads: List[dict],
+                                  hhs: List[dict], bbox: List[float],
+                                  west: float, north: float, mpp: float,
+                                  P: Callable) -> List[dict]:
+    """
+    Векторизованная версия anchor_candidates.
+    Скоринг: размер × центричность × близость к дороге × компактность × бонус.
+
+    Возвращает топ-N кандидатов (отсортированы по убыванию score).
+    """
+    if not hhs:
+        clat, clon = v_lat, v_lon
+    else:
+        clat = sum(h['lat'] for h in hhs) / len(hhs)
+        clon = sum(h['lon'] for h in hhs) / len(hhs)
+
+    # Сбор точек главных дорог для расчёта road_dist
+    main_pts = []
+    for r in roads:
+        if r['hw'] in MAIN_ROADS:
+            prev = None
+            for la, lo in r['pts']:
+                p = geo_to_px(la, lo, west, north, mpp)
+                if prev is not None:
+                    seg = math.hypot(p[0] - prev[0], p[1] - prev[1]) * mpp
+                    n_sub = int(seg / 10.0)
+                    for k in range(n_sub + 1):
+                        main_pts.append((prev[0] + (p[0] - prev[0]) * k / max(n_sub, 1),
+                                         prev[1] + (p[1] - prev[1]) * k / max(n_sub, 1)))
+                prev = p
+    main_arr = np.array(main_pts) if main_pts else np.zeros((0, 2), dtype=np.float32)
+
+    cands = []
+    for b in buildings:
+        la, lo = b['center']
+        if not (bbox[0] <= lo <= bbox[2] and bbox[1] <= la <= bbox[3]):
+            continue
+        tags = b.get('tags', {})
+        bt = tags.get('building', 'yes')
+        if bt in BAD_BUILDINGS:
+            continue
+        x, y = geo_to_px(la, lo, west, north, mpp)
+        pts = [geo_to_px(pla, plo, west, north, mpp) for pla, plo in b['poly']]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        bw, bh = max(xs) - min(xs), max(ys) - min(ys)
+        asp = max(bw, bh) / max(1e-6, min(bw, bh))
+        compact = 1.0 if asp < 2.2 else (2.2 / asp)
+        dcent_m = math.hypot((la - clat) * M_PER_DEG_LAT,
+                              (lo - clon) * M_PER_DEG_LAT * math.cos(math.radians(la)))
+        centr = max(0.0, 1.0 - dcent_m / 1200.0)
+        area = b['area']
+        sz = (1.0 if 150 <= area <= 500 else
+              (0.75 if 90 <= area < 150 else
+               (0.5 if 500 < area <= 900 else 0.25)))
+        # road_dist через векторизованный расчёт
+        if len(main_arr) > 0:
+            d2 = ((main_arr[:, 0] - x) ** 2 + (main_arr[:, 1] - y) ** 2).min()
+            rd = math.sqrt(float(d2)) * mpp
+        else:
+            rd = 999.0
+        road_s = (1.0 if rd < 25 else
+                  (0.6 if rd < 50 else
+                   (0.3 if rd < 90 else 0.1)))
+        tag_bonus = (1.4 if (tags.get('amenity') or
+                              bt in ('public', 'civic', 'commercial', 'retail', 'office'))
+                     else 1.0)
+        cands.append(dict(id=b['id'], lat=la, lon=lo, x=x, y=y,
+                           area=area, asp=round(asp, 1), rd=round(rd, 1),
+                           dcent=round(dcent_m), bw=bw, bh=bh,
+                           score=round(sz * centr * road_s * compact * tag_bonus, 4),
+                           tags=tags))
+    cands.sort(key=lambda c: -c['score'])
+    return cands
+
+
+# ----------------------------------------------------------------------------
+# CV-детекция крыш (numpy + scipy, без OpenCV)
+# ----------------------------------------------------------------------------
+def detect_roofs_numpy(mos_rgb, mpp, P):
     """CV-детекция крыш через HSV-маски цветов кровли + морфология.
 
-    Аналог detect_roofs() из оригинального ftth_pipeline.py, но без OpenCV:
-      - PIL для конвертации RGB→HSV;
-      - numpy для масок цветов (синий/красный/оранжевый/зелёный/серый);
-      - scipy.ndimage для морфологии (close + open) и связных компонент.
+    Аналог detect_roofs() из оригинала, но без OpenCV:
+      - PIL для конвертации RGB->HSV;
+      - numpy для масок цветов;
+      - scipy.ndimage для морфологии и связных компонент.
 
     Возвращает список (x, y, w, h) — кандидаты крыш в пикселях мозаики.
-    Площади 40–350 м² (при ~0.38 м/px → ~280–2400 px²).
     """
     from scipy import ndimage
-    from PIL import Image
+    from PIL import Image as _Img
 
-    # Конвертация в HSV через PIL (быстрее, чем ручная формула в numpy)
-    img = Image.fromarray(mos_rgb)
+    img = _Img.fromarray(mos_rgb)
     hsv_img = img.convert('HSV')
     hsv = np.array(hsv_img)
-    h = hsv[..., 0].astype(np.int32)  # PIL HSV: H 0-255
-    s = hsv[..., 1].astype(np.int32)  # S 0-255
-    v = hsv[..., 2].astype(np.int32)  # V 0-255
+    h = hsv[..., 0].astype(np.int32)
+    s = hsv[..., 1].astype(np.int32)
+    v = hsv[..., 2].astype(np.int32)
 
-    # Маски цветов кровли (PIL H = cv2 H * 2)
     blue = (h >= 180) & (h <= 264) & (s > 65) & (v > 50)
     red = ((h <= 24) | (h >= 336)) & (s > 75) & (v > 55)
     orange = (h >= 26) & (h <= 70) & (s > 85) & (v > 95)
     green = (h >= 80) & (h <= 170) & (s > 65) & (v > 50)
     gray = (s < 50) & (v > 140) & (v < 248)
     mask = blue | red | orange | green | gray
-
     m = mask.astype(bool)
 
-    # Морфология: CLOSE (dilate→erode) затем OPEN (erode→dilate)
     struct = np.ones((3, 3), dtype=bool)
     m_closed = ndimage.binary_dilation(m, structure=struct)
     m_closed = ndimage.binary_erosion(m_closed, structure=struct)
     m_opened = ndimage.binary_erosion(m_closed, structure=struct)
     m_opened = ndimage.binary_dilation(m_opened, structure=struct)
 
-    # Связные компоненты
     labeled, n_comp = ndimage.label(m_opened)
     if n_comp == 0:
         return []
 
-    min_area = P('hh_cv_min_area_px', 280)
-    max_area = P('hh_cv_max_area_px', 2400)
-    min_side = P('hh_cv_min_side_px', 10)
-    min_fill = P('hh_cv_min_fill', 0.5)
-    max_aspect = P('hh_cv_max_aspect', 4.0)
+    min_area = P('hh_cv_min_area_px')
+    max_area = P('hh_cv_max_area_px')
+    min_side = P('hh_cv_min_side_px')
+    min_fill = P('hh_cv_min_fill')
+    max_aspect = P('hh_cv_max_aspect')
 
-    # Векторизованный расчёт площадей и bounding boxes
     slices = ndimage.find_objects(labeled)
     res = []
     for i, sl in enumerate(slices, start=1):
@@ -271,488 +997,18 @@ def detect_roofs_numpy(mos_rgb: np.ndarray, mpp: float,
     return res
 
 
-# ----------------------------- Векторизованная граница села -----------------------------
-def detect_bbox_vectorized(v_lat, v_lon, buildings, probe, P):
-    if not buildings:
-        return list(probe)
-    grid_m = P('boundary_grid_m')
-    margin = P('boundary_margin_m')
-    close_cells = max(1, int(round(P('boundary_close_m') / grid_m)))
-    min_bld = P('boundary_min_bld')
-    keep_frac = P('boundary_keep_frac')
-    centers = np.array([b['center'] for b in buildings], dtype=np.float64)
-    lats = centers[:, 0]
-    lons = centers[:, 1]
-    lat_min_arr, lon_min_arr = lats.min(), lons.min()
-    dlat = grid_m / M_PER_DEG_LAT
-    dlon = grid_m / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
-    row = np.floor((lats - lat_min_arr) / dlat).astype(np.int32)
-    col = np.floor((lons - lon_min_arr) / dlon).astype(np.int32)
-    rc_max = row.max() + 1 if len(row) else 1
-    cc_max = col.max() + 1 if len(col) else 1
-    grid = np.zeros((rc_max, cc_max), dtype=np.int32)
-    np.add.at(grid, (row, col), 1)
-    try:
-        from scipy import ndimage
-        r = close_cells
-        yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
-        kernel = (xx * xx + yy * yy <= r * r + 1).astype(np.uint8)
-        dil = ndimage.binary_dilation(grid > 0, structure=kernel)
-        labeled, n_comp = ndimage.label(dil)
-    except ImportError:
-        n_comp = 0
-        labeled = (grid > 0).astype(np.int32)
-    if n_comp == 0:
-        return list(probe)
-    sizes = np.bincount(labeled.ravel())
-    sizes[0] = 0
-    coms = ndimage.center_of_mass(np.ones_like(labeled), labeled, range(1, n_comp + 1)) if n_comp > 0 else []
-    probe_half_w = (probe[2] - probe[0]) * M_PER_DEG_LAT * math.cos(math.radians(v_lat)) / 2
-    probe_half_h = (probe[3] - probe[1]) * M_PER_DEG_LAT / 2
-    r_max = keep_frac * math.hypot(probe_half_w, probe_half_h)
-    kept_cells = []
-    for i, com in enumerate(coms, start=1):
-        if sizes[i] < min_bld:
-            continue
-        cla = lat_min_arr + (com[0] + 0.5) * dlat
-        clo = lon_min_arr + (com[1] + 0.5) * dlon
-        distm = math.hypot((cla - v_lat) * M_PER_DEG_LAT,
-                           (clo - v_lon) * M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
-        if distm <= r_max:
-            kept_cells.append((i, com))
-    if not kept_cells:
-        biggest = sizes.argmax()
-        com = coms[biggest - 1]
-        kept_cells = [(biggest, com)]
-    mask = np.zeros_like(labeled, dtype=bool)
-    for i, _ in kept_cells:
-        mask |= (labeled == i)
-    rows = np.where(mask.any(axis=1))[0]
-    cols = np.where(mask.any(axis=0))[0]
-    if len(rows) == 0 or len(cols) == 0:
-        return list(probe)
-    rmin, rmax = int(rows[0]), int(rows[-1])
-    cmin, cmax = int(cols[0]), int(cols[-1])
-    lat_min = lat_min_arr + rmin * dlat - margin / M_PER_DEG_LAT
-    lat_max = lat_min_arr + (rmax + 1) * dlat + margin / M_PER_DEG_LAT
-    lon_min = lon_min_arr + cmin * dlon - margin / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
-    lon_max = lon_min_arr + (cmax + 1) * dlon + margin / (M_PER_DEG_LAT * math.cos(math.radians(v_lat)))
-    return [max(lon_min, probe[0]), max(lat_min, probe[1]),
-            min(lon_max, probe[2]), min(lat_max, probe[3])]
+# ----------------------------------------------------------------------------
+# Детекция домохозяйств (OSM + CV-супплект крыш)
+# ----------------------------------------------------------------------------
+def detect_households(buildings: List[dict], roads: List[dict],
+                       v: dict, bbox: List[float],
+                       west: float, north: float, mpp: float,
+                       W: int, H: int, P: Callable,
+                       mosaic_rgb=None, progress_cb=None):
+    """Детекция домохозяйств: OSM-здания + опциональный CV-супплект крыш.
 
-
-# ----------------------------- Дорожный граф -----------------------------
-class RoadGraphBuilder:
-    def __init__(self, mpp, densify_m):
-        self.mpp = mpp
-        self.densify_m = densify_m
-        self.pts: List[Tuple[float, float]] = []
-        self.idx: Dict[Tuple[float, float], int] = {}
-        self.edges: List[Tuple[int, int, float]] = []
-
-    def add_node(self, x, y):
-        k = (round(x, 1), round(y, 1))
-        i = self.idx.get(k)
-        if i is None:
-            i = len(self.pts)
-            self.pts.append((x, y))
-            self.idx[k] = i
-        return i
-
-    def add_polyline(self, pts_px):
-        prev = None
-        for p in pts_px:
-            cur = self.add_node(p[0], p[1])
-            if prev is not None and cur != prev:
-                d = math.hypot(self.pts[cur][0] - self.pts[prev][0],
-                               self.pts[cur][1] - self.pts[prev][1]) * self.mpp
-                if d > 0.05:
-                    self.edges.append((prev, cur, d))
-            prev = cur
-
-    def build(self, roads, west, north, bounds=None):
-        from scipy.spatial import cKDTree
-        from scipy.sparse import csr_matrix
-        mstep = self.densify_m
-        for r in roads:
-            pts = [geo_to_px(la, lo, west, north, self.mpp) for la, lo in r['pts']]
-            dens = [pts[0]] if pts else []
-            for p in pts[1:]:
-                q = dens[-1]
-                seg = math.hypot(p[0] - q[0], p[1] - q[1]) * self.mpp
-                n_sub = int(seg / mstep)
-                for k in range(1, n_sub + 1):
-                    dens.append((q[0] + (p[0] - q[0]) * k / max(n_sub, 1),
-                                 q[1] + (p[1] - q[1]) * k / max(n_sub, 1)))
-                if seg < mstep:
-                    dens.append(p)
-            self.add_polyline(dens)
-        Pt = np.array(self.pts, dtype=np.float32) if self.pts else np.zeros((0, 2), dtype=np.float32)
-        n = len(Pt)
-        allowed = np.ones(n, dtype=bool)
-        if bounds is not None and n > 0:
-            bx0, by0, bx1, by1 = bounds
-            allowed = ((Pt[:, 0] >= bx0) & (Pt[:, 0] <= bx1) &
-                       (Pt[:, 1] >= by0) & (Pt[:, 1] <= by1))
-        rows, cols, vals = [], [], []
-        for (u, w, l) in self.edges:
-            if not (allowed[u] and allowed[w]):
-                continue
-            rows += [u, w]
-            cols += [w, u]
-            vals += [l, l]
-        C = csr_matrix((vals, (rows, cols)), shape=(n, n), dtype=np.float32)
-        return dict(P=Pt, kdt=cKDTree(Pt) if n > 0 else None, C=C, allowed=allowed)
-
-
-# ----------------------------- Ядро построения сети -----------------------------
-def build_network_optimized(osm_data, hhs, anchor, geo, P, bounds=None, progress_cb=None):
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import dijkstra
-    mpp = geo['mpp']
-    west, north = geo['west'], geo['north']
-    MERGE_M, DEDUP_M = P('net_merge_m'), P('net_dedup_m')
-    MAX_DROP_M = P('net_max_drop_m')
-    INTERM = P('net_intermediate_m')
-    ax, ay = anchor['x'], anchor['y']
-
-    def _notify(msg, frac=0.0):
-        if progress_cb:
-            try:
-                progress_cb(msg, frac)
-            except Exception:
-                pass
-
-    _notify("Строю дорожный граф...", 0.05)
-    builder = RoadGraphBuilder(mpp, P('net_densify_m'))
-    graph = builder.build(osm_data['roads'], west, north, bounds)
-    Pt, tree, C, allowed = graph['P'], graph['kdt'], graph['C'], graph['allowed']
-    n = len(Pt)
-    logger.info("Граф: %d узлов, %d рёбер", n, C.nnz // 2)
-
-    _notify(f"Граф готов: {n} узлов. Привязка ДХ...", 0.15)
-    root_id = int(tree.query([ax, ay])[1]) if tree is not None else 0
-    hh_nodes: List[Optional[int]] = []
-    snap_d: List[float] = []
-    if tree is not None:
-        for h in hhs:
-            d, i = tree.query([h['cx'], h['cy']])
-            if d * mpp > P('net_snap_max_m') or not allowed[i]:
-                hh_nodes.append(None)
-            else:
-                hh_nodes.append(int(i))
-            snap_d.append(float(d * mpp))
-    else:
-        hh_nodes = [None] * len(hhs)
-        snap_d = [0.0] * len(hhs)
-
-    ok = [i for i in range(len(hhs)) if hh_nodes[i] is not None]
-    terminals = list(dict.fromkeys([root_id] + [hh_nodes[i] for i in ok]))
-    tpos = {t: i for i, t in enumerate(terminals)}
-
-    _notify("Считаю кратчайшие пути (Dijkstra)...", 0.25)
-    Dm, pred_m = dijkstra(C, indices=terminals, return_predecessors=True, directed=False)
-
-    K = len(terminals)
-    Dt = np.array([[Dm[i][t] for t in terminals] for i in range(K)], dtype=np.float32)
-    in_tree = [False] * K
-    best_w = [np.inf] * K
-    parent = [-1] * K
-    best_w[0] = 0.0
-    mst_pairs: List[Tuple[int, int]] = []
-    for _ in range(K):
-        b, bw = -1, np.inf
-        for i in range(K):
-            if not in_tree[i] and best_w[i] < bw:
-                b, bw = i, best_w[i]
-        if b < 0:
-            break
-        in_tree[b] = True
-        if parent[b] >= 0:
-            mst_pairs.append((terminals[parent[b]], terminals[b]))
-        for j in range(K):
-            if not in_tree[j] and Dt[b][j] < best_w[j]:
-                best_w[j] = float(Dt[b][j])
-                parent[j] = b
-
-    _notify("Строю SPT-дерево от корня...", 0.45)
-    union = set()
-    for (u, w) in mst_pairs:
-        iu = tpos[u]
-        cur = w
-        while cur != u and cur >= 0:
-            p = int(pred_m[iu][cur])
-            if p < 0:
-                break
-            union.add((min(p, cur), max(p, cur)))
-            cur = p
-    ur, uc, uv = [], [], []
-    elen: Dict[Tuple[int, int], float] = {}
-    Pt64 = Pt.astype(np.float64) if Pt.dtype != np.float64 else Pt
-    for (u, w) in union:
-        l = float(math.hypot(Pt64[u][0] - Pt64[w][0], Pt64[u][1] - Pt64[w][1]) * mpp)
-        elen[(u, w)] = l
-        ur += [u, w]
-        uc += [w, u]
-        uv += [l, l]
-    U = csr_matrix((uv, (ur, uc)), shape=(n, n), dtype=np.float64)
-
-    _notify("Считаю SPT от корня...", 0.55)
-    DU, predU = dijkstra(U, indices=root_id, return_predecessors=True, directed=False)
-    predU = predU.astype(np.int64)
-
-    def path_to_root(node):
-        pth = [node]
-        cur = node
-        guard = 0
-        while cur != root_id:
-            p = int(predU[cur])
-            if p < 0:
-                return None
-            pth.append(p)
-            cur = p
-            guard += 1
-            if guard > n:
-                return None
-        return pth
-
-    hh_paths = {i: path_to_root(hh_nodes[i]) for i in ok}
-    couplers: Dict[int, List[int]] = {}
-
-    def add_coup(node, hi):
-        couplers.setdefault(node, []).append(hi)
-
-    order = sorted([i for i in ok if hh_paths[i] is not None], key=lambda i: float(DU[hh_nodes[i]]))
-    for hi in order:
-        pth = hh_paths[hi]
-        acc = 0.0
-        serve = None
-        for i in range(len(pth) - 1):
-            if pth[i] in couplers:
-                serve = pth[i]
-                break
-            acc += elen.get((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])), 0.0)
-            if acc > MERGE_M:
-                break
-        add_coup(serve if serve is not None else pth[0], hi)
-
-    tree_edges = set()
-    for hi in order:
-        pth = hh_paths[hi]
-        for i in range(len(pth) - 1):
-            tree_edges.add((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])))
-    deg: Dict[int, int] = {}
-    for (u, w) in tree_edges:
-        deg[u] = deg.get(u, 0) + 1
-        deg[w] = deg.get(w, 0) + 1
-    for node, dg in deg.items():
-        if dg >= 3:
-            couplers.setdefault(node, [])
-
-    _notify("Дедупликация муфт...", 0.65)
-
-    def path_dist_nodes(a, b):
-        if a == b:
-            return 0.0
-        pa = path_to_root(a)
-        if pa is None or b not in pa:
-            return 1e9
-        ib = pa.index(b)
-        return sum(elen.get((min(pa[i], pa[i + 1]), max(pa[i], pa[i + 1])), 0.0) for i in range(ib))
-
-    changed = True
-    while changed:
-        changed = False
-        nodes_c = sorted(couplers.keys(), key=lambda c: float(DU[c]))
-        for i in range(len(nodes_c)):
-            if nodes_c[i] not in couplers:
-                continue
-            for j in range(i + 1, len(nodes_c)):
-                a, b = nodes_c[i], nodes_c[j]
-                if a not in couplers or b not in couplers:
-                    continue
-                if path_dist_nodes(b, a) < DEDUP_M:
-                    couplers[a].extend(couplers.pop(b))
-                    changed = True
-                    break
-            if changed:
-                break
-
-    def serving(hi):
-        pth = hh_paths[hi]
-        for i in range(len(pth)):
-            if pth[i] in couplers:
-                return pth[i]
-        return root_id
-
-    def drop_len(hi, sc):
-        pth = hh_paths[hi]
-        si = pth.index(sc)
-        return sum(elen.get((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])), 0.0) for i in range(si))
-
-    _notify("Размещение промежуточных муфт...", 0.75)
-    for hi in order:
-        pth = hh_paths[hi]
-        hh = hhs[hi]
-        a_h = pth[0]
-        yard = float(math.hypot(hh['cx'] - Pt64[a_h][0], hh['cy'] - Pt64[a_h][1]) * mpp)
-        sc = serving(hi)
-        dl = drop_len(hi, sc) + yard
-        while dl > MAX_DROP_M:
-            acc = 0.0
-            placed = None
-            for i in range(len(pth) - 1):
-                acc += elen.get((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])), 0.0)
-                if acc >= INTERM:
-                    placed = pth[i + 1]
-                    break
-            if placed is None or placed in couplers or placed == sc:
-                break
-            couplers.setdefault(placed, [])
-            sc = serving(hi)
-            dl2 = drop_len(hi, sc)
-            if dl2 >= dl:
-                break
-            dl = dl2 + yard
-
-    _notify("Считаю дропы...", 0.85)
-    import hashlib
-    drops = []
-    for hi in range(len(hhs)):
-        if hh_nodes[hi] is None or hh_paths.get(hi) is None:
-            continue
-        pth = hh_paths[hi]
-        sc = serving(hi)
-        si = pth.index(sc)
-        poly = [list(Pt64[pth[i]]) for i in range(si, -1, -1)]
-        a_h = pth[0]
-        hx, hy = hhs[hi]['cx'], hhs[hi]['cy']
-        sx, sy = float(Pt64[a_h][0]), float(Pt64[a_h][1])
-        dx, dy = hx - sx, hy - sy
-        dist = math.hypot(dx, dy)
-        if dist < 1e-6:
-            entry = [[sx, sy], [hx, hy]]
-        else:
-            hsh = int(hashlib.md5(str(hhs[hi].get('id', hi)).encode()).hexdigest()[:6], 16) / 0xFFFFFF
-            f_along = 0.30 + 0.35 * hsh
-            side = 1 if hsh > 0.5 else -1
-            ux, uy = dx / dist, dy / dist
-            px_, py_ = -uy, ux
-            if dist * mpp < 10:
-                m1 = [sx + dx * 0.55 + px_ * 2.5 * side, sy + dy * 0.55 + py_ * 2.5 * side]
-                entry = [[sx, sy], m1, [hx, hy]]
-            else:
-                a1 = [sx + px_ * dist * f_along * 0.55 + ux * dist * 0.22,
-                      sy + py_ * dist * f_along * 0.55 + uy * dist * 0.22]
-                a2 = [a1[0] + ux * dist * 0.5 + px_ * dist * 0.12 * side,
-                      a1[1] + uy * dist * 0.5 + py_ * dist * 0.12 * side]
-                entry = [[sx, sy], a1, a2, [hx, hy]]
-        poly += entry
-        dl = (sum(elen.get((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])), 0.0) for i in range(si))
-              + sum(math.hypot(entry[k + 1][0] - entry[k][0], entry[k + 1][1] - entry[k][1]) for k in range(len(entry) - 1)) * mpp)
-        drops.append(dict(hh=hi, coupler=sc, poly=poly, length_m=round(dl, 1)))
-
-    feeder_edges = set()
-    for c in couplers:
-        pth = path_to_root(c)
-        if pth is None:
-            continue
-        for i in range(len(pth) - 1):
-            feeder_edges.add((min(pth[i], pth[i + 1]), max(pth[i], pth[i + 1])))
-    feeder_m = sum(elen.get(e, float(math.hypot(Pt64[e[0]][0] - Pt64[e[1]][0],
-                                                  Pt64[e[0]][1] - Pt64[e[1]][1]) * mpp)) for e in feeder_edges)
-    drop_m = sum(dd['length_m'] for dd in drops)
-    coup_list = sorted([c for c in couplers if c != root_id])
-    stats = dict(households=len(hhs), served=len(drops), couplers=len(coup_list),
-                 feeder_km=round(feeder_m / 1000, 2), drop_km=round(drop_m / 1000, 2),
-                 avg_drop_m=round(drop_m / max(1, len(drops)), 1),
-                 max_drop_m=round(max((dd['length_m'] for dd in drops), default=0), 1))
-
-    _notify("Сеть построена.", 1.0)
-    logger.info("ОРШ id=%s; обслужено %d/%d ДХ; муфт %d; магистраль %.2f км",
-                anchor.get('id'), stats['served'], len(hhs), stats['couplers'], stats['feeder_km'])
-
-    return dict(anchor=dict(x=ax, y=ay, lat=anchor['lat'], lon=anchor['lon'],
-                             bld_id=anchor.get('id'), area=anchor.get('area')),
-                root_node=root_id,
-                couplers=[dict(node=int(c), x=float(Pt64[c][0]), y=float(Pt64[c][1]),
-                                label=f'М{i + 1}') for i, c in enumerate(coup_list)],
-                feeder_edges=[[[float(Pt64[e[0]][0]), float(Pt64[e[0]][1])],
-                                [float(Pt64[e[1]][0]), float(Pt64[e[1]][1])]]
-                               for e in sorted(feeder_edges)],
-                drops=drops, stats=stats,
-                road_Pt=Pt64,
-                road_pred=pred_m[0])
-
-
-# ----------------------------- ЦУ -----------------------------
-def anchor_candidates_vectorized(v_lat, v_lon, buildings, roads, hhs, bbox,
-                                  west, north, mpp, P):
-    if not hhs:
-        clat, clon = v_lat, v_lon
-    else:
-        clat = sum(h['lat'] for h in hhs) / len(hhs)
-        clon = sum(h['lon'] for h in hhs) / len(hhs)
-    main_pts = []
-    for r in roads:
-        if r['hw'] in MAIN_ROADS:
-            prev = None
-            for la, lo in r['pts']:
-                p = geo_to_px(la, lo, west, north, mpp)
-                if prev is not None:
-                    seg = math.hypot(p[0] - prev[0], p[1] - prev[1]) * mpp
-                    n_sub = int(seg / 10.0)
-                    for k in range(n_sub + 1):
-                        main_pts.append((prev[0] + (p[0] - prev[0]) * k / max(n_sub, 1),
-                                         prev[1] + (p[1] - prev[1]) * k / max(n_sub, 1)))
-                prev = p
-    main_arr = np.array(main_pts) if main_pts else np.zeros((0, 2), dtype=np.float32)
-    cands = []
-    for b in buildings:
-        la, lo = b['center']
-        if not (bbox[0] <= lo <= bbox[2] and bbox[1] <= la <= bbox[3]):
-            continue
-        tags = b.get('tags', {})
-        bt = tags.get('building', 'yes')
-        if bt in BAD_BUILDINGS:
-            continue
-        x, y = geo_to_px(la, lo, west, north, mpp)
-        pts = [geo_to_px(pla, plo, west, north, mpp) for pla, plo in b['poly']]
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        bw, bh = max(xs) - min(xs), max(ys) - min(ys)
-        asp = max(bw, bh) / max(1e-6, min(bw, bh))
-        compact = 1.0 if asp < 2.2 else (2.2 / asp)
-        dcent_m = math.hypot((la - clat) * M_PER_DEG_LAT,
-                              (lo - clon) * M_PER_DEG_LAT * math.cos(math.radians(la)))
-        centr = max(0.0, 1.0 - dcent_m / 1200.0)
-        area = b['area']
-        sz = (1.0 if 150 <= area <= 500 else (0.75 if 90 <= area < 150 else (0.5 if 500 < area <= 900 else 0.25)))
-        if len(main_arr) > 0:
-            d2 = ((main_arr[:, 0] - x) ** 2 + (main_arr[:, 1] - y) ** 2).min()
-            rd = math.sqrt(float(d2)) * mpp
-        else:
-            rd = 999.0
-        road_s = (1.0 if rd < 25 else (0.6 if rd < 50 else (0.3 if rd < 90 else 0.1)))
-        tag_bonus = (1.4 if (tags.get('amenity') or bt in ('public', 'civic', 'commercial', 'retail', 'office')) else 1.0)
-        cands.append(dict(id=b['id'], lat=la, lon=lo, x=x, y=y, area=area, asp=round(asp, 1),
-                           rd=round(rd, 1), dcent=round(dcent_m), bw=bw, bh=bh,
-                           score=round(sz * centr * road_s * compact * tag_bonus, 4), tags=tags))
-    cands.sort(key=lambda c: -c['score'])
-    return cands
-
-
-# ----------------------------- Домохозяйства -----------------------------
-def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
-                      mosaic_rgb=None, progress_cb=None):
-    """Детекция домохозяйств: OSM-здания + опциональный CV-суплемент крыш.
-
-    Если mosaic_rgb передан (numpy array HxWx3), используется CV-детекция
-    крыш по спутниковому снимку для дополнения OSM-данных. Кандидаты
-    фильтруются по контексту: близость к дороге, не ближе 15м к OSM-зданию,
-    рядом с другими объектами.
-
-    Возвращает (households, stats) где stats = dict(osm=N, cv=M, total_blds=K).
+    Если mosaic_rgb передан — используется CV-детекция крыш.
+    Возвращает (households, stats).
     """
     from scipy.spatial import cKDTree
 
@@ -779,7 +1035,8 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
             if seg < 15.0:
                 road_pts.append(p)
             prev = p
-    road_arr = np.array([(x, y) for x, y in road_pts if -100 <= x <= W + 100 and -100 <= y <= H + 100],
+    road_arr = np.array([(x, y) for x, y in road_pts
+                          if -100 <= x <= W + 100 and -100 <= y <= H + 100],
                          dtype=np.float32) if road_pts else np.zeros((0, 2), dtype=np.float32)
     road_tree = cKDTree(road_arr) if len(road_arr) > 0 else None
 
@@ -812,25 +1069,22 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
                               src='osm', tags=b.get('tags', {}), poly=pts))
     _notify(f"OSM-зданий в зоне: {len(osm_blds)}", 0.1)
 
-    # --- CV-супplement крыш по космоснимку ---
+    # --- CV-супplement крыш ---
     cv_blds = []
     if mosaic_rgb is not None:
         _notify("CV-детекция крыш по космоснимку...", 0.15)
         roofs = detect_roofs_numpy(mosaic_rgb, mpp, P)
         _notify(f"CV: найдено {len(roofs)} кандидатов крыш", 0.4)
-
-        # Контекст-фильтры (2 итерации: возле дорог → возле принятых)
         accepted = []
         for it in range(2):
             for (x, y, w_, h_) in roofs:
                 if any(abs(x - a[0]) < 8 and abs(y - a[1]) < 8 for a in accepted):
                     continue
-                # Не ближе 15м к OSM-зданию
-                if any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_min_sep_m', 15.0)
+                if any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_min_sep_m')
                        for b in osm_blds):
                     continue
-                ctx_ok = (near_road(x, y, P('hh_cv_near_road_m', 75.0)) if it == 0 else
-                          any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_ctx_m', 90.0)
+                ctx_ok = (near_road(x, y, P('hh_cv_near_road_m')) if it == 0 else
+                          any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_ctx_m')
                               for b in osm_blds + [dict(cx=a[0], cy=a[1]) for a in accepted]))
                 if ctx_ok:
                     accepted.append((x, y, w_, h_))
@@ -840,9 +1094,9 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
                               (a[0] + a[2] / 2, a[1] + a[3] / 2),
                               (a[0] - a[2] / 2, a[1] + a[3] / 2)])
                   for a in accepted]
-        _notify(f"CV: принято {len(cv_blds)} крыш после контекст-фильтров", 0.5)
+        _notify(f"CV: принято {len(cv_blds)} крыш", 0.5)
     else:
-        _notify("CV-супплект: выключен (нет космоснимка)", 0.15)
+        _notify("CV-супплект: выключен", 0.15)
 
     all_blds = osm_blds + cv_blds
 
@@ -891,9 +1145,17 @@ def detect_households(buildings, roads, v, bbox, west, north, mpp, W, H, P,
     return households, stats
 
 
-# ----------------------------- BoQ дерево -----------------------------
+# ----------------------------------------------------------------------------
+# ОПТИМИЗАЦИЯ: расчёт BoQ (схема A и схема D) с оптическим бюджетом
+# ----------------------------------------------------------------------------
 class TreeOptimized:
-    def __init__(self, net, mpp, P):
+    """Дерево магистрали села (BFS-ориентация от ЦУ).
+
+    Оптимизация: индексы в numpy, словари для быстрого доступа.
+    Поддержка схемы D (зонные ОРШ) с жадным разбиением и оптическим бюджетом.
+    """
+
+    def __init__(self, net: dict, mpp: float, P: Callable):
         self.mpp = mpp
         self.P = P
         self.net = net
@@ -908,7 +1170,9 @@ class TreeOptimized:
             adj[k2].add(k1)
             self.edge_len[(min(k1, k2), max(k1, k2))] = L
         ax, ay = net['anchor']['x'], net['anchor']['y']
-        self.root = min(adj.keys(), key=lambda k: (k[0] - ax) ** 2 + (k[1] - ay) ** 2)
+        self.root = min(adj.keys(),
+                        key=lambda k: (k[0] - ax) ** 2 + (k[1] - ay) ** 2)
+
         self.parent: Dict[Tuple, Optional[Tuple]] = {self.root: None}
         self.children: Dict[Tuple, List[Tuple]] = defaultdict(list)
         order = deque([self.root])
@@ -921,14 +1185,17 @@ class TreeOptimized:
                     self.children[u].append(w)
                     self.bfs.append(w)
                     order.append(w)
+
         self.edges = []
         for (k1, k2), L in self.edge_len.items():
             if self.parent.get(k1) == k2:
                 self.edges.append((k2, k1, L))
             elif self.parent.get(k2) == k1:
                 self.edges.append((k1, k2, L))
+
         ck = {c['node']: nkey([c['x'], c['y']]) for c in net['couplers']}
-        self.coupler_nodes = {k for c in net['couplers'] if (k := nkey([c['x'], c['y']])) in adj}
+        self.coupler_nodes = {k for c in net['couplers']
+                              if (k := nkey([c['x'], c['y']])) in adj}
         self.homes: Dict[Tuple, int] = defaultdict(int)
         for d in net['drops']:
             k = ck.get(d['coupler'])
@@ -938,12 +1205,13 @@ class TreeOptimized:
         self.dh_total = len(net['drops'])
         self.drop_km = sum(d['length_m'] for d in net['drops']) / 1000.0
         self.n_couplers = len(net['couplers'])
+
         self.dist: Dict[Tuple, float] = {self.root: 0.0}
         for u in self.bfs[1:]:
             p = self.parent[u]
             self.dist[u] = self.dist[p] + self.edge_len[(min(u, p), max(u, p))]
 
-    def flows(self, cuts):
+    def flows(self, cuts: List[Tuple]):
         P = self.P
         cutset = set(cuts)
         zr = {self.root: self.root}
@@ -975,12 +1243,15 @@ class TreeOptimized:
         return zr, zone_dh, spl, df, ffw
 
     def _edge_accounting(self, cuts, flows=None):
+        """Генератор (L_м, F_волокон, несёт_фидер). Без дорожного графа —
+        фидеры по дереву (упрощённый режим, CPU-friendly)."""
         P = self.P
         if flows is None:
             flows = self.flows(cuts)
         _, _, spl, df, ffw_tree = flows
         for _, child, L in self.edges:
-            F = max(P('min_fibers'), ceilr(P('fiber_reserve') * df[child]) + ffw_tree[child])
+            F = max(P('min_fibers'),
+                    ceilr(P('fiber_reserve') * df[child]) + ffw_tree[child])
             yield L, F, ffw_tree[child] > 0
 
     def raw_fkm(self, cuts):
@@ -988,13 +1259,16 @@ class TreeOptimized:
         fkm = sum(F * L for L, F, _ in self._edge_accounting(cuts, fl))
         return fkm, fl[3]
 
-    def partition_greedy(self, s_min_km):
+    def partition_greedy(self, s_min_km: float):
+        """Жадные врезы по максимальной маржинальной экономии волокно-км."""
         cuts = []
         cur_fkm, df = self.raw_fkm(cuts)
         log = []
         while True:
             best_u, best_sav = None, 0.0
-            cands = [u for u in self.coupler_nodes if u != self.root and u not in cuts and df.get(u, 0) >= self.P('min_zone_dh')]
+            cands = [u for u in self.coupler_nodes
+                     if u != self.root and u not in cuts
+                     and df.get(u, 0) >= self.P('min_zone_dh')]
             for u in cands:
                 fkm_new, _ = self.raw_fkm(cuts + [u])
                 sav = (cur_fkm - fkm_new) / 1000.0
@@ -1026,20 +1300,27 @@ class TreeOptimized:
                 fiber_km += L / 1000.0 * s
             if has_ff:
                 feeder_route_km += L / 1000.0
+
         routes = []
         for node, dh in self.homes.items():
             r = max(0.0, self.dist[node] - self.dist[zr[node]])
             routes.extend([r] * dh)
         routes.sort()
-        zinfo = [dict(zone='ЦУ (корневая)', root_dist_m=0.0, houses=zone_dh.get(self.root, 0),
+
+        zinfo = [dict(zone='ЦУ (корневая)', root_dist_m=0.0,
+                       houses=zone_dh.get(self.root, 0),
                        splitters=spl.get(self.root, 0), feeder_fibers=0,
-                       orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= zone_dh.get(self.root, 0) * 1.1),
+                       orsh_ports=next((p2 for p2 in P('orsh_ports_row')
+                                        if p2 >= zone_dh.get(self.root, 0) * 1.1),
                                          ceilr(zone_dh.get(self.root, 0) * 1.1)))]
         for z in cuts:
-            zinfo.append(dict(zone='зонный ОРШ', root_dist_m=round(self.dist[z], 1),
-                              houses=zone_dh[z], splitters=spl[z],
+            zinfo.append(dict(zone='зонный ОРШ',
+                              root_dist_m=round(self.dist[z], 1),
+                              houses=zone_dh[z],
+                              splitters=spl[z],
                               feeder_fibers=ceilr(P('fiber_reserve') * spl[z]),
-                              orsh_ports=next((p2 for p2 in P('orsh_ports_row_zone') if p2 >= zone_dh[z] * 1.1),
+                              orsh_ports=next((p2 for p2 in P('orsh_ports_row_zone')
+                                               if p2 >= zone_dh[z] * 1.1),
                                                 ceilr(zone_dh[z] * 1.1))))
         mufty = self.n_couplers - sum(1 for z in cuts if z in self.coupler_nodes)
         dh = self.dh_total
@@ -1051,15 +1332,18 @@ class TreeOptimized:
             i = min(len(sv) - 1, max(0, int(math.ceil(q / 100.0 * len(sv))) - 1))
             return sv[i]
 
-        return dict(cuts=[str(c) for c in cuts], zones=zinfo, n_zones=len(cuts),
+        return dict(cuts=[str(c) for c in cuts], zones=zinfo,
+                    n_zones=len(cuts),
                     orsh=1 + len(cuts), fiber_km=round(fiber_km, 1),
                     cable_km_raw=round(cable_km, 3),
-                    km_by_size={str(s): round(km_by_size.get(s, 0.0), 3) for s in std if km_by_size.get(s, 0.0) > 0},
+                    km_by_size={str(s): round(km_by_size.get(s, 0.0), 3)
+                                 for s in std if km_by_size.get(s, 0.0) > 0},
                     top_fibers=top_fibers, max_parallel=max_parallel,
                     feeder_route_km=round(feeder_route_km, 2),
                     splitters=spl_total, olt_ports=spl_total,
                     orsh_ports=sum(z['orsh_ports'] for z in zinfo),
-                    mufty=mufty, splices=ceilr((2 * dh + 2 * spl_total) * P('consum_stock')),
+                    mufty=mufty,
+                    splices=ceilr((2 * dh + 2 * spl_total) * P('consum_stock')),
                     pigtails=dh + 2 * spl_total,
                     suspend_kits=math.ceil(cable_km * P('suspend_per_km')),
                     routes=dict(avg_m=round(sum(routes) / max(1, len(routes)), 1),
@@ -1068,7 +1352,8 @@ class TreeOptimized:
                                  max_m=round(routes[-1], 1) if routes else 0))
 
 
-def boq_centralized(net, mpp, P):
+def boq_centralized(net: dict, mpp: float, P: Callable) -> dict:
+    """Схема A: сплиттеры 1:64 в ОРШ, выделенное волокно каждому ДХ."""
     std = P('std_fibers')
     adj: Dict[Tuple, set] = defaultdict(set)
     edge_len: Dict[Tuple, float] = {}
@@ -1082,6 +1367,7 @@ def boq_centralized(net, mpp, P):
         edge_len[(min(k1, k2), max(k1, k2))] = L
     ax, ay = net['anchor']['x'], net['anchor']['y']
     root = min(adj.keys(), key=lambda k: (k[0] - ax) ** 2 + (k[1] - ay) ** 2)
+
     ck = {c['node']: nkey([c['x'], c['y']]) for c in net['couplers']}
     homes_direct: Counter = Counter()
     unmapped = 0
@@ -1091,6 +1377,7 @@ def boq_centralized(net, mpp, P):
             k = root
             unmapped += 1
         homes_direct[k] += 1
+
     parent: Dict[Tuple, Optional[Tuple]] = {root: None}
     bfs = [root]
     order = deque([root])
@@ -1101,11 +1388,13 @@ def boq_centralized(net, mpp, P):
                 parent[w] = u
                 bfs.append(w)
                 order.append(w)
+
     sub = dict(homes_direct)
     for u in reversed(bfs):
         p2 = parent[u]
         if p2 is not None:
             sub[p2] = sub.get(p2, 0) + sub.get(u, 0)
+
     km_by_size: Dict[int, float] = defaultdict(float)
     fiber_km = total_cable_km = 0.0
     top_fibers = max_parallel = 0
@@ -1126,34 +1415,46 @@ def boq_centralized(net, mpp, P):
             km_by_size[s] += L / 1000.0
             total_cable_km += L / 1000.0
             fiber_km += L / 1000.0 * s
+
     drops = net['drops']
     dh = len(drops)
     drop_km = sum(d['length_m'] for d in drops) / 1000.0
-    cable_km = {str(s): round(roundup01(km_by_size.get(s, 0.0) * P('cable_stock')), 1) for s in std if km_by_size.get(s, 0.0) > 0}
-    m = dict(orsh=1, splitters=ceilr(dh / P('split_ratio')),
-             olt_ports=ceilr(dh / P('split_ratio')), pigtails=dh,
-             mufty=len(net['couplers']),
-             drop_cable_km=roundup01(drop_km * P('drop_stock')),
-             abonent_boxes=dh, fast_conn=ceilr(dh * P('consum_stock')),
-             splices=ceilr(2 * dh * P('consum_stock')),
-             kdzs=ceilr(2 * dh * P('consum_stock')),
-             suspend_kits=math.ceil(total_cable_km * P('suspend_per_km')),
-             drop_anchors=P('drop_anchors_per_dh') * dh,
-             drop_fix=P('drop_fix_per_dh') * dh,
-             orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1), ceilr(dh * 1.1)))
+    cable_km = {str(s): round(roundup01(km_by_size.get(s, 0.0) * P('cable_stock')), 1)
+                for s in std if km_by_size.get(s, 0.0) > 0}
+    m = dict(
+        orsh=1,
+        splitters=ceilr(dh / P('split_ratio')),
+        olt_ports=ceilr(dh / P('split_ratio')),
+        pigtails=dh, mufty=len(net['couplers']),
+        drop_cable_km=roundup01(drop_km * P('drop_stock')),
+        abonent_boxes=dh, fast_conn=ceilr(dh * P('consum_stock')),
+        splices=ceilr(2 * dh * P('consum_stock')),
+        kdzs=ceilr(2 * dh * P('consum_stock')),
+        suspend_kits=math.ceil(total_cable_km * P('suspend_per_km')),
+        drop_anchors=P('drop_anchors_per_dh') * dh,
+        drop_fix=P('drop_fix_per_dh') * dh,
+        orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1), ceilr(dh * 1.1)),
+    )
     m.update({f'cable_{s}': cable_km.get(str(s), 0.0) for s in std})
-    return dict(dhx_served=dh, couplers=len(net['couplers']), mufty=len(net['couplers']),
-                feeder_km=round(feeder_m / 1000, 2), drop_km=round(drop_km, 2),
-                avg_drop_m=round(sum(d['length_m'] for d in drops) / max(1, dh), 1),
-                max_drop_m=round(max((d['length_m'] for d in drops), default=0), 1),
-                top_fibers=top_fibers, max_parallel=max_parallel,
-                total_cable_km=round(total_cable_km, 3), fiber_km=round(fiber_km, 1),
-                cable_km=cable_km, cable_km_raw=round(total_cable_km * P('cable_stock'), 2),
-                drop_cable_km=m['drop_cable_km'], orsh_ports=m['orsh_ports'],
-                splitters64=m['splitters'], materials=m, checks=dict(unmapped_drop_couplers=unmapped))
+    return dict(
+        dhx_served=dh, couplers=len(net['couplers']),
+        mufty=len(net['couplers']),
+        feeder_km=round(feeder_m / 1000, 2), drop_km=round(drop_km, 2),
+        avg_drop_m=round(sum(d['length_m'] for d in drops) / max(1, dh), 1),
+        max_drop_m=round(max((d['length_m'] for d in drops), default=0), 1),
+        top_fibers=top_fibers, max_parallel=max_parallel,
+        total_cable_km=round(total_cable_km, 3), fiber_km=round(fiber_km, 1),
+        cable_km=cable_km,
+        cable_km_raw=round(total_cable_km * P('cable_stock'), 2),
+        drop_cable_km=m['drop_cable_km'],
+        orsh_ports=m['orsh_ports'], splitters64=m['splitters'],
+        materials=m, checks=dict(unmapped_drop_couplers=unmapped),
+    )
 
 
-def optical_budget(t, cuts, zones_layout, max_drop_m, P):
+def optical_budget(t: TreeOptimized, cuts, zones_layout, max_drop_m: float,
+                    P: Callable) -> dict:
+    """Энергетический бюджет худшей линии каждой зоны (см. §VII ALGORITHM_FTTH.md)."""
     zr, zone_dh, spl, df, _ = t.flows(cuts)
     zworst: Dict[Tuple, Tuple[float, Tuple]] = {}
     for node in t.homes:
@@ -1176,35 +1477,52 @@ def optical_budget(t, cuts, zones_layout, max_drop_m, P):
             u = p
         feeder_m = zones_layout[zi]['root_dist_m']
         L_km = (feeder_m + dist_m + max_drop_m) / 1000.0
-        A = (P('ob_alpha_db_km') * L_km + P('ob_splitter_il_db') + 3 * P('ob_connector_db')
+        A = (P('ob_alpha_db_km') * L_km + P('ob_splitter_il_db')
+             + 3 * P('ob_connector_db')
              + (2 + n_tr + 2) * P('ob_splice_db') + P('ob_penalty_db'))
-        status = ('ok' if A + MC <= B else 'ok-hard' if A <= B else 'EXCEEDED')
-        rec = ('' if status == 'ok' else 'оптика Class C+ или сплиттер 1:32 для дальних PON-портов зоны' if status == 'ok-hard' else 'РЕДИЗАЙН: сдвинуть ОРШ к центру зоны / 1:32')
-        zones.append(dict(zone=zones_layout[zi].get('zone', ''), houses=zones_layout[zi]['houses'],
-                          feeder_m=round(feeder_m, 1), distrib_m=round(dist_m, 1),
-                          drop_max_m=max_drop_m, L_km=round(L_km, 3), transit_splices=n_tr,
-                          attenuation_db=round(A, 2), margin_db=round(B - A, 2),
+        status = ('ok' if A + MC <= B else
+                  'ok-hard' if A <= B else 'EXCEEDED')
+        rec = ('' if status == 'ok' else
+               'оптика Class C+ или сплиттер 1:32 для дальних PON-портов зоны'
+               if status == 'ok-hard' else
+               'РЕДИЗАЙН: сдвинуть ОРШ к центру зоны / 1:32')
+        zones.append(dict(zone=zones_layout[zi].get('zone', ''),
+                          houses=zones_layout[zi]['houses'],
+                          feeder_m=round(feeder_m, 1),
+                          distrib_m=round(dist_m, 1),
+                          drop_max_m=max_drop_m, L_km=round(L_km, 3),
+                          transit_splices=n_tr,
+                          attenuation_db=round(A, 2),
+                          margin_db=round(B - A, 2),
                           status=status, recommendation=rec))
-    return dict(model=dict(alpha_db_km=P('ob_alpha_db_km'), splitter_il_db=P('ob_splitter_il_db'),
-                            splice_db=P('ob_splice_db'), connector_db=P('ob_connector_db'),
-                            penalty_db=P('ob_penalty_db'), budget_class_b=B,
-                            budget_class_c=P('ob_budget_db_c'), margin_min_db=MC),
+    return dict(model=dict(alpha_db_km=P('ob_alpha_db_km'),
+                            splitter_il_db=P('ob_splitter_il_db'),
+                            splice_db=P('ob_splice_db'),
+                            connector_db=P('ob_connector_db'),
+                            penalty_db=P('ob_penalty_db'),
+                            budget_class_b=B,
+                            budget_class_c=P('ob_budget_db_c'),
+                            margin_min_db=MC),
                 worst_attenuation_db=max(z['attenuation_db'] for z in zones),
                 worst_margin_db=min(z['margin_db'] for z in zones),
                 all_ok=all(z['status'] != 'EXCEEDED' for z in zones),
-                all_ok_with_margin=all(z['status'] == 'ok' for z in zones), zones=zones)
+                all_ok_with_margin=all(z['status'] == 'ok' for z in zones),
+                zones=zones)
 
 
-# ----------------------------- VillageSpec и Planner -----------------------------
+# ----------------------------------------------------------------------------
+# Главный класс-планировщик
+# ----------------------------------------------------------------------------
 @dataclass
 class VillageSpec:
+    """Спецификация села (входные данные)."""
     key: str
     name: str
     lat: float
     lon: float
-    hh: int = 0
+    hh: int = 0  # ожидаемое число домохозяйств (для контроля)
     radius_m: float = 2500.0
-    zone_type: str = 'bbox'
+    zone_type: str = 'bbox'  # 'bbox' | 'radius'
     zone_radius: float = 900.0
     bbox_lock: Optional[List[float]] = None
     polygon_lock: Optional[List[Tuple[float, float]]] = None
@@ -1212,7 +1530,13 @@ class VillageSpec:
 
 
 class GPONPlanner:
-    def __init__(self, params=None, work_dir='.'):
+    """Главный класс-планировщик FTTH (GPON) для одного села.
+
+    Оптимизирован для CPU: всё через numpy/scipy, без CV/VLM.
+    """
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None,
+                 work_dir: str = '.'):
         self.params = dict(DEFAULT_PARAMS)
         if params:
             self.params.update(params)
@@ -1221,13 +1545,27 @@ class GPONPlanner:
         self._cache_dir = os.path.join(work_dir, 'osm_raw')
         os.makedirs(self._cache_dir, exist_ok=True)
 
-    def P(self, name, default=None):
+    def P(self, name: str, default=None):
         return self.params.get(name, default)
 
-    def run(self, village: VillageSpec, progress_cb: Optional[Callable[[str, float], None]] = None,
-            render_map: bool = False, download_tiles: bool = True,
-            use_cv_detection: bool = True) -> Dict[str, Any]:
-        def _notify(msg, frac=0.0):
+    def run(self, village: VillageSpec,
+            progress_cb: Optional[Callable[[str, float], None]] = None,
+            render_map: bool = False,
+            download_tiles: bool = True,
+            use_cv_detection: bool = True
+            ) -> Dict[str, Any]:
+        """Полный цикл проектирования села.
+
+        Возвращает dict с ключами:
+          - village: спецификация села
+          - bbox, geo: геометрия
+          - households: список ДХ
+          - anchor: выбранное здание ЦУ
+          - network: сеть (муфты, дропы, фидер)
+          - boq: материалы схем A и D
+          - optical_budget: бюджет худших линий зон
+        """
+        def _notify(msg: str, frac: float = 0.0):
             logger.info("[GPON] %s (%.0f%%)", msg, frac * 100)
             if progress_cb:
                 try:
@@ -1235,6 +1573,7 @@ class GPONPlanner:
                 except Exception:
                     pass
 
+        # === 1. fetch ===
         _notify(f"Загружаю OSM-данные для '{village.name}'...", 0.02)
         # Если задан polygon_lock — рассчитываем bbox из его точек
         if village.polygon_lock and len(village.polygon_lock) >= 3:
@@ -1248,9 +1587,12 @@ class GPONPlanner:
         else:
             radius = village.radius_m + self.P('probe_margin_m')
             dlat, dlon = meters_to_deg(radius, village.lat)
-            probe = (village.lon - dlon, village.lat - dlat, village.lon + dlon, village.lat + dlat)
+            probe = (village.lon - dlon, village.lat - dlat,
+                     village.lon + dlon, village.lat + dlat)
 
-        n_split = max(1, int(math.ceil((probe[2] - probe[0]) * M_PER_DEG_LAT * math.cos(math.radians(village.lat)) / 2100)))
+        # Скачиваем чанками ~2.1 км
+        n_split = max(1, int(math.ceil((probe[2] - probe[0]) * M_PER_DEG_LAT
+                                         * math.cos(math.radians(village.lat)) / 2100)))
         m_split = max(1, int(math.ceil((probe[3] - probe[1]) * M_PER_DEG_LAT / 2100)))
         all_nodes, all_ways = {}, {}
         for i in range(n_split):
@@ -1259,7 +1601,8 @@ class GPONPlanner:
                 x1 = probe[0] + (probe[2] - probe[0]) * (i + 1) / n_split
                 y0 = probe[1] + (probe[3] - probe[1]) * j / m_split
                 y1 = probe[1] + (probe[3] - probe[1]) * (j + 1) / m_split
-                cache_path = os.path.join(self._cache_dir, f"{village.key}_{x0:.4f}_{y0:.4f}_{x1:.4f}_{y1:.4f}.xml")
+                cache_path = os.path.join(self._cache_dir,
+                                          f"{village.key}_{x0:.4f}_{y0:.4f}_{x1:.4f}_{y1:.4f}.xml")
                 _notify(f"OSM чанк {i * m_split + j + 1}/{n_split * m_split}...",
                         0.02 + 0.18 * (i * m_split + j) / max(1, n_split * m_split))
                 data = fetch_osm_bbox(x0, y0, x1, y1, cache_path)
@@ -1274,23 +1617,29 @@ class GPONPlanner:
 
         # Определяем итоговый bbox для мозаики и сети
         if village.polygon_lock and len(village.polygon_lock) >= 3:
-            lats = [p[0] for p in village.polygon_lock]
-            lons = [p[1] for p in village.polygon_lock]
-            bbox = [min(lons), min(lats), max(lons), max(lats)]
+            lats_p = [p[0] for p in village.polygon_lock]
+            lons_p = [p[1] for p in village.polygon_lock]
+            bbox = [min(lons_p), min(lats_p), max(lons_p), max(lats_p)]
         elif village.bbox_lock:
             bbox = list(village.bbox_lock)
         else:
-            bbox = detect_bbox_vectorized(village.lat, village.lon, buildings, probe, self.P)
+            bbox = detect_bbox_vectorized(village.lat, village.lon, buildings,
+                                           probe, self.P)
         w_km = (bbox[2] - bbox[0]) * M_PER_DEG_LAT * math.cos(math.radians(village.lat)) / 1000
         h_km = (bbox[3] - bbox[1]) * M_PER_DEG_LAT / 1000
         _notify(f"Граница села: {w_km:.2f} x {h_km:.2f} км", 0.25)
 
+        # Геопривязка (без скачивания тайлов — мы используем локальную СК)
+        # м/пиксель: имитируем z18 (~0.38 м/px на 50° с.ш.)
         mpp = m_per_px(village.lat, 18)
         west = bbox[0]
         north = bbox[3]
-        W = int(round((bbox[2] - bbox[0]) * M_PER_DEG_LAT * math.cos(math.radians(village.lat)) / mpp))
+        # Размер мозаики в пикселях (для согласованности с оригиналом)
+        W = int(round((bbox[2] - bbox[0]) * M_PER_DEG_LAT
+                       * math.cos(math.radians(village.lat)) / mpp))
         H = int(round((bbox[3] - bbox[1]) * M_PER_DEG_LAT / mpp))
         geo = dict(west=west, north=north, mpp=mpp, W=W, H=H, zoom=18, bbox=bbox)
+
         osm_data = dict(bbox=bbox, roads=roads, buildings=buildings, pois=pois,
                         center=[village.lat, village.lon])
 
@@ -1326,10 +1675,16 @@ class GPONPlanner:
                 f"CV крыш: {hh_stats['cv']}, всего построек: {hh_stats['total_blds']})", 0.50)
 
         if not households:
-            raise RuntimeError(f"Не найдено ни одного домохозяйства для '{village.name}'.")
+            raise RuntimeError(
+                f"Не найдено ни одного домохозяйства для '{village.name}'. "
+                f"Возможно, в OSM нет разметки зданий в этом районе, "
+                f"или координаты села указаны неверно."
+            )
 
+        # === 3. anchor ===
         _notify("Выбор здания-якоря (ЦУ)...", 0.45)
-        cands = anchor_candidates_vectorized(village.lat, village.lon, buildings, roads, households,
+        cands = anchor_candidates_vectorized(village.lat, village.lon,
+                                              buildings, roads, households,
                                               bbox, west, north, mpp, self.P)
         if not cands:
             raise RuntimeError("Нет кандидатов ЦУ — проверьте зону и OSM-данные")
@@ -1338,19 +1693,28 @@ class GPONPlanner:
         anchor = cands[0]
         _notify(f"ЦУ: id={anchor['id']} ({anchor['area']:.0f} м², score={anchor['score']})", 0.50)
 
+        # === 4. network ===
         _notify("Построение сети (MST + SPT)...", 0.55)
-        net = build_network_optimized(osm_data, households, anchor, geo, self.P,
-                                       progress_cb=lambda m, f: _notify(m, 0.55 + 0.30 * f))
-        _notify(f"Сеть: муфт {net['stats']['couplers']}, магистраль {net['stats']['feeder_km']} км", 0.85)
+        net = build_network_optimized(osm_data, households, anchor, geo,
+                                       self.P, progress_cb=lambda m, f: _notify(m, 0.55 + 0.30 * f))
+        _notify(f"Сеть: муфт {net['stats']['couplers']}, "
+                f"магистраль {net['stats']['feeder_km']} км, "
+                f"дропы {net['stats']['drop_km']} км", 0.85)
 
+        # === 5. boq ===
         _notify("Расчёт материалов (схемы A и D)...", 0.88)
         a = boq_centralized(net, mpp, self.P)
         t = TreeOptimized(net, mpp, self.P)
+        # Контроль: A и D без врезов должны совпадать
         r0 = t.layout([])
         if abs(r0['fiber_km'] - a['fiber_km']) > 0.15:
-            logger.warning("Контроль A/D: fiber %s vs %s", r0['fiber_km'], a['fiber_km'])
+            logger.warning("Контроль A/D: fiber %s vs %s",
+                            r0['fiber_km'], a['fiber_km'])
+
         cuts, cut_log = t.partition_greedy(self.P('s_min_km'))
         r = t.layout(cuts)
+
+        # Гео-координаты зонных ОРШ
         zones_geo = []
         ax, ay = net['anchor']['x'], net['anchor']['y']
         alat, alon = net['anchor']['lat'], net['anchor']['lon']
@@ -1369,102 +1733,65 @@ class GPONPlanner:
                 zgeo = dict(px=None, lat=None, lon=None)
             zones_geo.append({**zdata, **zgeo})
 
-        # --- Фидерные трассы ЦУ → зонный ОРШ по дорожному графу ---
-        # Используем pred_m[0] (предшественники от корня в полном дорожном графе)
-        # для прокладки кратчайшего пути вдоль дорог, а не по прямой.
-        road_Pt = net.get('road_Pt')
-        road_pred = net.get('road_pred')
-        root_int = net['root_node']
-        ax_px, ay_px = net['anchor']['x'], net['anchor']['y']
-
-        # Обратное отображение: nkey → int индекс узла дорожного графа
-        nkey_to_int = {}
-        for c in net['couplers']:
-            nk = nkey([c['x'], c['y']])
-            nkey_to_int[nk] = c['node']
-
-        feeder_paths = []  # список путей в пикселях: [[x,y], ...]
-        # Зона 0 = ЦУ: путь — одна точка (сам ЦУ)
-        feeder_paths.append([[ax_px, ay_px]])
-
-        for z in cuts:
-            node_int = nkey_to_int.get(z)
-            if (node_int is None or road_Pt is None or road_pred is None
-                    or node_int >= len(road_pred)):
-                # Fallback: прямая линия от ЦУ до ОРШ
-                zxy = cpos.get(z)
-                if zxy:
-                    feeder_paths.append([[ax_px, ay_px], list(zxy)])
-                else:
-                    feeder_paths.append(None)
-                continue
-
-            # Трассируем путь от node_int к root_int по предшественникам
-            path_nodes = [node_int]
-            cur = node_int
-            guard = 0
-            while cur != root_int and guard < len(road_pred):
-                p = int(road_pred[cur])
-                if p < 0:
-                    break
-                path_nodes.append(p)
-                cur = p
-                guard += 1
-
-            # Конвертируем в пиксели, добавляем ЦУ в начало для замыкания
-            path_px = [[ax_px, ay_px]]
-            for n in reversed(path_nodes):
-                if n < len(road_Pt):
-                    path_px.append([float(road_Pt[n][0]), float(road_Pt[n][1])])
-            feeder_paths.append(path_px)
-
-        net['feeder_paths'] = feeder_paths
-        # Удаляем большие numpy-массивы — они не нужны в JSON-результате
-        net.pop('road_Pt', None)
-        net.pop('road_pred', None)
-
         cable_km = {str(s): roundup01(r['km_by_size'].get(str(s), 0.0) * self.P('cable_stock'))
-                    for s in self.P('std_fibers') if r['km_by_size'].get(str(s), 0.0) > 0}
+                    for s in self.P('std_fibers')
+                    if r['km_by_size'].get(str(s), 0.0) > 0}
         dh = t.dh_total
         drops_sorted = sorted(d['length_m'] for d in net['drops'])
-        max_drop = (drops_sorted[-1] if drops_sorted else 0)
-        m = dict(orsh=r['orsh'], orsh_cu=1, orsh_zone=r['n_zones'],
-                 splitters=r['splitters'], olt_ports=r['splitters'],
-                 pigtails=r['pigtails'], mufty=r['mufty'],
-                 drop_cable_km=roundup01(t.drop_km * self.P('drop_stock')),
-                 abonent_boxes=dh, fast_conn=ceilr(dh * self.P('consum_stock')),
-                 splices=r['splices'], kdzs=r['splices'],
-                 suspend_kits=r['suspend_kits'],
-                 drop_anchors=self.P('drop_anchors_per_dh') * dh,
-                 drop_fix=self.P('drop_fix_per_dh') * dh, orsh_ports=r['orsh_ports'])
-        m.update({f'cable_{s}': cable_km.get(str(s), 0.0) for s in self.P('std_fibers')})
-        vv = dict(num='', key=village.key, name=village.name, dhx_excel=village.hh,
-                  net='network.json', dhx_served=dh, couplers=t.n_couplers, mufty=r['mufty'],
-                  feeder_km=round(sum(L for _, _, L in t.edges) / 1000.0, 2),
-                  drop_km=round(t.drop_km, 2),
-                  avg_drop_m=round(sum(drops_sorted) / max(1, dh), 1),
-                  max_drop_m=round(max_drop, 1) if drops_sorted else 0,
-                  n_zones=r['n_zones'], orsh=r['orsh'], zones=zones_geo,
-                  fiber_km=r['fiber_km'], total_cable_km=r['cable_km_raw'],
-                  cable_km=cable_km,
-                  cable_km_raw=round(r['cable_km_raw'] * self.P('cable_stock'), 2),
-                  drop_cable_km=m['drop_cable_km'], orsh_ports=r['orsh_ports'],
-                  splitters64=r['splitters'], top_fibers=r['top_fibers'],
-                  max_parallel=r['max_parallel'], feeder_route_km=r['feeder_route_km'],
-                  routes=r['routes'], cut_log=cut_log, materials=m,
-                  scheme_a=dict(fiber_km=a['fiber_km'], cable_km_raw=a['cable_km_raw'],
-                                 drop_cable_km=a['drop_cable_km'], mufty=a['mufty'],
-                                 splitters64=a['splitters64'], splices=a['materials']['splices'],
-                                 orsh_ports=a['orsh_ports'],
-                                 total_length_km=round(a['cable_km_raw'] + a['drop_cable_km'], 1)),
-                  optical_budget=optical_budget(t, cuts, r['zones'], max_drop, self.P))
+        m = dict(
+            orsh=r['orsh'], orsh_cu=1, orsh_zone=r['n_zones'],
+            splitters=r['splitters'], olt_ports=r['splitters'],
+            pigtails=r['pigtails'], mufty=r['mufty'],
+            drop_cable_km=roundup01(t.drop_km * self.P('drop_stock')),
+            abonent_boxes=dh, fast_conn=ceilr(dh * self.P('consum_stock')),
+            splices=r['splices'], kdzs=r['splices'],
+            suspend_kits=r['suspend_kits'],
+            drop_anchors=self.P('drop_anchors_per_dh') * dh,
+            drop_fix=self.P('drop_fix_per_dh') * dh,
+            orsh_ports=r['orsh_ports'],
+        )
+        m.update({f'cable_{s}': cable_km.get(str(s), 0.0)
+                  for s in self.P('std_fibers')})
+
+        vv = dict(
+            num='', key=village.key, name=village.name,
+            dhx_excel=village.hh, net='network.json',
+            dhx_served=dh, couplers=t.n_couplers, mufty=r['mufty'],
+            feeder_km=round(sum(L for _, _, L in t.edges) / 1000.0, 2),
+            drop_km=round(t.drop_km, 2),
+            avg_drop_m=round(sum(drops_sorted) / max(1, dh), 1),
+            max_drop_m=round(drops_sorted[-1], 1) if drops_sorted else 0,
+            n_zones=r['n_zones'], orsh=r['orsh'], zones=zones_geo,
+            fiber_km=r['fiber_km'], total_cable_km=r['cable_km_raw'],
+            cable_km=cable_km,
+            cable_km_raw=round(r['cable_km_raw'] * self.P('cable_stock'), 2),
+            drop_cable_km=m['drop_cable_km'],
+            orsh_ports=r['orsh_ports'], splitters64=r['splitters'],
+            top_fibers=r['top_fibers'], max_parallel=r['max_parallel'],
+            feeder_route_km=r['feeder_route_km'], routes=r['routes'],
+            cut_log=cut_log, materials=m,
+            scheme_a=dict(fiber_km=a['fiber_km'],
+                           cable_km_raw=a['cable_km_raw'],
+                           drop_cable_km=a['drop_cable_km'],
+                           mufty=a['mufty'], splitters64=a['splitters64'],
+                           splices=a['materials']['splices'],
+                           orsh_ports=a['orsh_ports'],
+                           total_length_km=round(a['cable_km_raw'] + a['drop_cable_km'], 1)),
+            optical_budget=optical_budget(t, cuts, r['zones'],
+                                          vv_max_drop := (drops_sorted[-1] if drops_sorted else 0),
+                                          self.P),
+        )
         vv['total_length_km'] = round(vv['cable_km_raw'] + vv['drop_cable_km'], 1)
         vv['s_min_km'] = float(self.P('s_min_km'))
 
-        _notify(f"BoQ: A вол-км {a['fiber_km']}, D вол-км {r['fiber_km']}, зон {r['n_zones']}", 0.95)
+        _notify(f"BoQ: A вол-км {a['fiber_km']}, "
+                f"D вол-км {r['fiber_km']}, "
+                f"зон {r['n_zones']}", 0.95)
         ob = vv['optical_budget']
-        _notify(f"Бюджет B+: худшая линия {ob['worst_attenuation_db']:.2f} дБ (маржа {ob['worst_margin_db']:.2f} дБ)", 0.97)
+        _notify(f"Бюджет B+: худшая линия {ob['worst_attenuation_db']:.2f} дБ "
+                f"(маржа {ob['worst_margin_db']:.2f} дБ)", 0.97)
 
+        # === 6. map (опционально) ===
         map_path = None
         preview_path = None
         if render_map:
@@ -1475,13 +1802,22 @@ class GPONPlanner:
                 os.makedirs(cache_dir, exist_ok=True)
                 maps_dir = os.path.join(self.work_dir, 'maps')
                 os.makedirs(maps_dir, exist_ok=True)
+
                 map_path, preview_path = render_network_map(
-                    village=village.__dict__, bbox=bbox, geo=geo, households=households,
-                    network=net, boq=vv, optical_budget=ob, work_dir=self.work_dir,
-                    output_dir=maps_dir, cache_tiles_dir=cache_dir,
+                    village=village.__dict__,
+                    bbox=bbox,
+                    geo=geo,
+                    households=households,
+                    network=net,
+                    boq=vv,
+                    optical_budget=ob,
+                    work_dir=self.work_dir,
+                    output_dir=maps_dir,
+                    cache_tiles_dir=cache_dir,
                     progress_cb=lambda m, f: _notify(m, 0.98 + 0.02 * f),
                     download_tiles=download_tiles,
-                    preloaded_mosaic=mosaic_img)
+                    preloaded_mosaic=mosaic_img,
+                )
                 _notify(f"Карта сохранена: {map_path}", 1.0)
             except Exception as e:
                 logger.error("Не удалось отрисовать карту: %s", e)
@@ -1489,26 +1825,41 @@ class GPONPlanner:
         else:
             _notify("Готово (без карты)", 1.0)
 
-        return dict(village=village.__dict__, bbox=bbox, geo=geo,
-                    households=households, anchor_cands=cands[:5], network=net,
-                    boq=vv, optical_budget=ob, map_path=map_path, preview_path=preview_path,
-                    hh_stats=hh_stats)
+        return dict(
+            village=village.__dict__,
+            bbox=bbox, geo=geo,
+            households=households, anchor_cands=cands[:5],
+            network=net, boq=vv,
+            optical_budget=ob,
+            map_path=map_path,
+            preview_path=preview_path,
+            hh_stats=hh_stats,
+        )
 
 
+# ----------------------------------------------------------------------------
+# CLI для тестирования
+# ----------------------------------------------------------------------------
 if __name__ == '__main__':
     import argparse
     import json
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+    logging.basicConfig(level=logging.INFO,
+                         format='%(asctime)s [%(levelname)s] %(message)s')
+
     ap = argparse.ArgumentParser(description='GPON FTTH planner (CPU-optimized)')
     ap.add_argument('--lat', type=float, required=True, help='широта центра села')
     ap.add_argument('--lon', type=float, required=True, help='долгота центра села')
     ap.add_argument('--name', default='test', help='имя села (латиницей)')
     ap.add_argument('--radius', type=float, default=2500.0, help='радиус поиска, м')
-    ap.add_argument('--work-dir', default='./gpon_work', help='директория для кэша и результатов')
+    ap.add_argument('--work-dir', default='./gpon_work',
+                    help='директория для кэша и результатов')
     ap.add_argument('--no-cv', action='store_true', help='выключить CV-детекцию крыш')
     ap.add_argument('--no-map', action='store_true', help='не отрисовывать карту')
     args = ap.parse_args()
-    village = VillageSpec(key=args.name, name=args.name, lat=args.lat, lon=args.lon,
+
+    village = VillageSpec(key=args.name, name=args.name,
+                           lat=args.lat, lon=args.lon,
                            radius_m=args.radius)
     planner = GPONPlanner(work_dir=args.work_dir)
 
@@ -1520,6 +1871,7 @@ if __name__ == '__main__':
                           use_cv_detection=not args.no_cv)
     out_path = os.path.join(args.work_dir, f"{args.name}_result.json")
 
+    # Сериализация
     def _conv(o):
         if isinstance(o, (np.integer,)):
             return int(o)
@@ -1541,7 +1893,9 @@ if __name__ == '__main__':
           f"(OSM: {hs.get('osm', '?')}, CV: {hs.get('cv', '?')}, всего построек: {hs.get('total_blds', '?')})")
     print(f"  муфт: {result['network']['stats']['couplers']}")
     print(f"  магистраль: {result['network']['stats']['feeder_km']} км")
+    print(f"  дропы: {result['network']['stats']['drop_km']} км")
     print(f"  зоны (D): {result['boq']['n_zones']}")
-    print(f"  волокно-км A/D: {result['boq']['scheme_a']['fiber_km']} / {result['boq']['fiber_km']}")
+    print(f"  волокно-км A/D: {result['boq']['scheme_a']['fiber_km']} / "
+          f"{result['boq']['fiber_km']}")
     print(f"  худшая линия: {result['optical_budget']['worst_attenuation_db']:.2f} дБ "
           f"(маржа {result['optical_budget']['worst_margin_db']:.2f} дБ)")
