@@ -966,11 +966,11 @@ def detect_roofs_numpy(mos_rgb, mpp, P):
     if n_comp == 0:
         return []
 
-    min_area = P('hh_cv_min_area_px')
-    max_area = P('hh_cv_max_area_px')
-    min_side = P('hh_cv_min_side_px')
-    min_fill = P('hh_cv_min_fill')
-    max_aspect = P('hh_cv_max_aspect')
+    min_area = P('hh_cv_min_area_px', 280)
+    max_area = P('hh_cv_max_area_px', 2400)
+    min_side = P('hh_cv_min_side_px', 10)
+    min_fill = P('hh_cv_min_fill', 0.5)
+    max_aspect = P('hh_cv_max_aspect', 4.0)
 
     slices = ndimage.find_objects(labeled)
     res = []
@@ -1080,11 +1080,11 @@ def detect_households(buildings: List[dict], roads: List[dict],
             for (x, y, w_, h_) in roofs:
                 if any(abs(x - a[0]) < 8 and abs(y - a[1]) < 8 for a in accepted):
                     continue
-                if any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_min_sep_m')
+                if any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_min_sep_m', 15.0)
                        for b in osm_blds):
                     continue
-                ctx_ok = (near_road(x, y, P('hh_cv_near_road_m')) if it == 0 else
-                          any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_ctx_m')
+                ctx_ok = (near_road(x, y, P('hh_cv_near_road_m', 75.0)) if it == 0 else
+                          any(math.hypot(x - b['cx'], y - b['cy']) * mpp < P('hh_cv_ctx_m', 90.0)
                               for b in osm_blds + [dict(cx=a[0], cy=a[1]) for a in accepted]))
                 if ctx_ok:
                     accepted.append((x, y, w_, h_))
