@@ -28,6 +28,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+# Снимаем ограничение на размер изображения для крупных сёл
+Image.MAX_IMAGE_PIXELS = None
 
 logger = logging.getLogger(__name__)
 

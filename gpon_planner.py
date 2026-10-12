@@ -45,6 +45,11 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Снимаем ограничение Pillow на размер изображения (DecompressionBombWarning)
+# Нужно для крупных сёл с мозаиками >178 Мп (14000×14000 px и больше)
+from PIL import Image as _PIL_Image
+_PIL_Image.MAX_IMAGE_PIXELS = None
+
 import numpy as np
 
 logger = logging.getLogger(__name__)

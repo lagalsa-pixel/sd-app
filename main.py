@@ -24,6 +24,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, Optional
 
 from PIL import Image, ImageTk
+# Снимаем ограничение на размер изображения для крупных сёл
+Image.MAX_IMAGE_PIXELS = None
 
 import config
 from generator import SDGenerator, save_image
