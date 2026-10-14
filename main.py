@@ -594,19 +594,23 @@ class GPONTab(ttk.Frame):
 
         # Параметры (s_min, min_zone)
         ttk.Label(frame, text="Порог окупаемости зонного ОРШ, волокно-км:").pack(anchor="w", **pad)
-        self.s_min_var = tk.DoubleVar(value=15.0)
-        ttk.Scale(frame, from_=5, to=50, variable=self.s_min_var,
+        ttk.Label(frame, text="Меньше = больше зон = короче фидеры = ниже затухание",
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w", **pad)
+        self.s_min_var = tk.DoubleVar(value=8.0)
+        ttk.Scale(frame, from_=2, to=50, variable=self.s_min_var,
                   command=lambda v: self.s_min_var.set(round(float(v), 1))).pack(fill="x", padx=8)
-        self.s_min_label = ttk.Label(frame, text="15.0")
+        self.s_min_label = ttk.Label(frame, text="8.0")
         self.s_min_label.pack(anchor="e", padx=8)
         self.s_min_var.trace_add("write", lambda *_: self.s_min_label.config(
             text=f"{self.s_min_var.get():.1f}"))
 
         ttk.Label(frame, text="Мин. ДХ в зоне (заполнение ≥75%):").pack(anchor="w", **pad)
-        self.min_zone_var = tk.IntVar(value=48)
+        ttk.Label(frame, text="Меньше = больше зон = короче линии",
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w", **pad)
+        self.min_zone_var = tk.IntVar(value=32)
         ttk.Scale(frame, from_=16, to=128, variable=self.min_zone_var,
                   command=lambda v: self.min_zone_var.set(int(float(v)))).pack(fill="x", padx=8)
-        self.min_zone_label = ttk.Label(frame, text="48")
+        self.min_zone_label = ttk.Label(frame, text="32")
         self.min_zone_label.pack(anchor="e", padx=8)
         self.min_zone_var.trace_add("write", lambda *_: self.min_zone_label.config(
             text=str(self.min_zone_var.get())))
