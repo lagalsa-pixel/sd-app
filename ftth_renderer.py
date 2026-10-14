@@ -28,8 +28,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-# Снимаем ограничение на размер изображения для крупных сёл
-Image.MAX_IMAGE_PIXELS = None
 
 logger = logging.getLogger(__name__)
 
@@ -370,8 +368,11 @@ def render_network_map(
             except Exception:
                 pass
 
-    # === 1. Базовый снимок: скачиваем мозаику тайлов ===
-    if download_tiles:
+    # === 1. Базовый снимок: используем предзагруженную мозаику или скачиваем ===
+    if preloaded_mosaic is not None:
+        _notify("Использую предзагруженную мозаику...", 0.0)
+        base = preloaded_mosaic.convert('RGB') if hasattr(preloaded_mosaic, 'convert') else preloaded_mosaic
+    elif download_tiles:
         _notify("Скачиваю спутниковые тайлы Google z18...", 0.0)
         try:
             base, geo_tiles = stitch_mosaic(tuple(bbox), 18, cache_tiles_dir,
