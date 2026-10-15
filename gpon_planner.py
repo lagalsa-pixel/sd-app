@@ -45,6 +45,8 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from PIL import Image as _PIL_Image
+_PIL_Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -664,36 +666,37 @@ def build_network_optimized(osm_data: dict, hhs: List[dict], anchor: dict,
         if dg >= 3:
             couplers.setdefault(node, [])
 
-    _notify("Дедупликация муфт...", 0.65)
-    # Дедупликация муфт ближе DEDUP_M по дереву
-    def path_dist_nodes(a: int, b: int) -> float:
-        if a == b:
-            return 0.0
-        pa = path_to_root(a)
-        if pa is None or b not in pa:
-            return 1e9
-        ib = pa.index(b)
-        return sum(elen.get((min(pa[i], pa[i + 1]),
-                              max(pa[i], pa[i + 1])), 0.0)
-                   for i in range(ib))
-
+    _notify(f"Дедупликация муфт ({len(couplers)} шт.)...", 0.65)
+    # ОПТИМИЗИРОВАННАЯ дедупликация: для каждой муфты ищем только
+    # ближайшую муфту на пути к корню (в пределах DEDUP_M), а не
+    # сравниваем все пары. O(n * path_length) вместо O(n^3)
     changed = True
-    while changed:
+    _dedup_iter = 0
+    while changed and _dedup_iter < 5:
         changed = False
+        _dedup_iter += 1
         nodes_c = sorted(couplers.keys(), key=lambda c: float(DU[c]))
-        for i in range(len(nodes_c)):
-            if nodes_c[i] not in couplers:
+        for a in nodes_c:
+            if a not in couplers:
                 continue
-            for j in range(i + 1, len(nodes_c)):
-                a, b = nodes_c[i], nodes_c[j]
-                if a not in couplers or b not in couplers:
-                    continue
-                if path_dist_nodes(b, a) < DEDUP_M:
-                    couplers[a].extend(couplers.pop(b))
+            pth = path_to_root(a)
+            if pth is None:
+                continue
+            acc = 0.0
+            for i in range(len(pth) - 1):
+                acc += elen.get((min(pth[i], pth[i + 1]),
+                                max(pth[i], pth[i + 1])), 0.0)
+                if acc > DEDUP_M:
+                    break
+                candidate = pth[i + 1]
+                if candidate in couplers and candidate != a:
+                    couplers[candidate].extend(couplers.pop(a))
                     changed = True
                     break
             if changed:
                 break
+
+    _notify(f"Дедупликация завершена: {len(couplers)} муфт (итераций: {_dedup_iter})", 0.70)
 
     def serving(hi: int) -> int:
         pth = hh_paths[hi]
@@ -1382,7 +1385,7 @@ def boq_centralized(net: dict, mpp: float, P: Callable) -> dict:
         suspend_kits=math.ceil(total_cable_km * P('suspend_per_km')),
         drop_anchors=P('drop_anchors_per_dh') * dh,
         drop_fix=P('drop_fix_per_dh') * dh,
-        orsh_ports=next(p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1),
+        orsh_ports=next((p2 for p2 in P('orsh_ports_row') if p2 >= dh * 1.1), ceilr(dh * 1.1)),
     )
     m.update({f'cable_{s}': cable_km.get(str(s), 0.0) for s in std})
     return dict(
