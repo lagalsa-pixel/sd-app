@@ -352,6 +352,7 @@ def render_network_map(
     cache_tiles_dir: str,
     progress_cb: Optional[Callable[[str, float], None]] = None,
     download_tiles: bool = True,
+    preloaded_mosaic=None,
 ) -> Tuple[str, str]:
     """
     Отрисовать карту сети FTTH (схема D) на спутниковой мозаике.
